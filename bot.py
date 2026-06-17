@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent
 ENV_PATH = ROOT / ".env"
 DB_PATH = ROOT / "bot_data.sqlite3"
 KRASNOYARSK_TZ = "Asia/Krasnoyarsk"
+DB_INIT_LOCK = threading.RLock()
 
 SOURCE_PIPELINE_DEFAULT = 10915210
 SOURCE_STATUS_DEFAULT = 85847182
@@ -35,6 +36,14 @@ DEFAULT_MANAGERS = [
     (7074220, "Дегтярева Юлия", 15, 1, 20),
     (2328073, "Павел", 15, 1, 30),
 ]
+
+SALES_GROUP_STATUSES = {
+    "не смог реализовать",
+    "не было коммуникации",
+    "мертвое царство",
+    "закрыто и не реализовано",
+    "принял заявку",
+}
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -268,10 +277,24 @@ def db() -> Iterable[sqlite3.Connection]:
         conn.close()
 
 
+def ensure_db_ready() -> None:
+    with DB_INIT_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            init_db()
+
+
 def init_db() -> None:
-    with db() as conn:
-        conn.executescript(
-            """
+    with DB_INIT_LOCK:
+        with db() as conn:
+            conn.executescript(
+                """
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -329,35 +352,37 @@ def init_db() -> None:
                 payload TEXT
             );
             """
-        )
-        defaults = {
-            "source_pipeline_id": str(SOURCE_PIPELINE_DEFAULT),
-            "source_status_id": str(SOURCE_STATUS_DEFAULT),
-            "dest_pipeline_id": str(DEST_PIPELINE_DEFAULT),
-            "dest_status_id": str(DEST_STATUS_DEFAULT),
-            "schedule_time": "09:00",
-            "timezone": KRASNOYARSK_TZ,
-            "last_auto_run_date": "",
-            "source_history_last_sync_at": "0",
-            "source_history_last_checked_at": "0",
-        }
-        for key, value in defaults.items():
-            conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (key, value))
-        existing = conn.execute("SELECT COUNT(*) FROM managers").fetchone()[0]
-        if existing == 0:
-            conn.executemany(
-                "INSERT INTO managers(user_id, name, daily_limit, enabled, sort_order) VALUES(?, ?, ?, ?, ?)",
-                DEFAULT_MANAGERS,
             )
+            defaults = {
+                "source_pipeline_id": str(SOURCE_PIPELINE_DEFAULT),
+                "source_status_id": str(SOURCE_STATUS_DEFAULT),
+                "dest_pipeline_id": str(DEST_PIPELINE_DEFAULT),
+                "dest_status_id": str(DEST_STATUS_DEFAULT),
+                "schedule_time": "09:00",
+                "timezone": KRASNOYARSK_TZ,
+                "last_auto_run_date": "",
+                "source_history_last_sync_at": "0",
+                "source_history_last_checked_at": "0",
+            }
+            for key, value in defaults.items():
+                conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (key, value))
+            existing = conn.execute("SELECT COUNT(*) FROM managers").fetchone()[0]
+            if existing == 0:
+                conn.executemany(
+                    "INSERT INTO managers(user_id, name, daily_limit, enabled, sort_order) VALUES(?, ?, ?, ?, ?)",
+                    DEFAULT_MANAGERS,
+                )
 
 
 def get_setting(key: str) -> str:
+    ensure_db_ready()
     with db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else ""
 
 
 def set_setting(key: str, value: Any) -> None:
+    ensure_db_ready()
     with db() as conn:
         conn.execute(
             "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -375,6 +400,7 @@ def config() -> Dict[str, int]:
 
 
 def managers(enabled_only: bool = False) -> List[sqlite3.Row]:
+    ensure_db_ready()
     query = "SELECT * FROM managers"
     if enabled_only:
         query += " WHERE enabled = 1"
@@ -389,6 +415,7 @@ def lead_number(lead: Dict[str, Any]) -> Optional[int]:
 
 
 def set_state(chat_id: int, state: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    ensure_db_ready()
     with db() as conn:
         conn.execute(
             "INSERT INTO admin_states(chat_id, state, payload) VALUES(?, ?, ?) "
@@ -398,11 +425,13 @@ def set_state(chat_id: int, state: str, payload: Optional[Dict[str, Any]] = None
 
 
 def get_state(chat_id: int) -> Optional[sqlite3.Row]:
+    ensure_db_ready()
     with db() as conn:
         return conn.execute("SELECT * FROM admin_states WHERE chat_id = ?", (chat_id,)).fetchone()
 
 
 def clear_state(chat_id: int) -> None:
+    ensure_db_ready()
     with db() as conn:
         conn.execute("DELETE FROM admin_states WHERE chat_id = ?", (chat_id,))
 
@@ -852,6 +881,40 @@ def pipeline_status_labels(client: AmoClient, groups: Dict[Tuple[int, int], List
     return labels
 
 
+def normalized_stage_name(value: str) -> str:
+    return " ".join(value.lower().replace("ё", "е").split())
+
+
+def moved_group_key(pipeline_name: str, status_name: str, pipeline_id: int, status_id: int) -> Tuple[str, str]:
+    normalized_pipeline = normalized_stage_name(pipeline_name)
+    normalized_status = normalized_stage_name(status_name)
+    if normalized_pipeline == "прогрев базы":
+        return "group:warmup", "Прогрев базы"
+    if normalized_status in SALES_GROUP_STATUSES:
+        return "group:sales", "Отдел продаж"
+    return f"actual:{pipeline_id}:{status_id}", f"{pipeline_name} → {status_name}"
+
+
+def moved_groups(current: List[Dict[str, Any]], client: AmoClient) -> Dict[str, Dict[str, Any]]:
+    raw_groups: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    for lead in current:
+        key = (int(lead["pipeline_id"]), int(lead["status_id"]))
+        raw_groups.setdefault(key, []).append(lead)
+
+    labels = pipeline_status_labels(client, raw_groups)
+    result: Dict[str, Dict[str, Any]] = {}
+    for (pipeline_id, status_id), leads in raw_groups.items():
+        pipeline_name, status_name = labels[(pipeline_id, status_id)].split(" → ", 1)
+        group_key, group_label = moved_group_key(pipeline_name, status_name, pipeline_id, status_id)
+        if group_key not in result:
+            result[group_key] = {"label": group_label, "leads": [], "sort": 0}
+        result[group_key]["leads"].extend(leads)
+
+    for group in result.values():
+        group["leads"].sort(key=lambda item: (lead_number(item) or 0, int(item["id"])), reverse=True)
+    return result
+
+
 def moved_overview(force_sync: bool = False) -> Tuple[str, List[List[Dict[str, str]]]]:
     sync_source_history_from_amo(force=force_sync)
     ids = source_history_ids()
@@ -863,11 +926,7 @@ def moved_overview(force_sync: bool = False) -> Tuple[str, List[List[Dict[str, s
         )
     client = amo()
     current = client.get_leads_by_ids(ids)
-    groups: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
-    for lead in current:
-        key = (int(lead["pipeline_id"]), int(lead["status_id"]))
-        groups.setdefault(key, []).append(lead)
-    labels = pipeline_status_labels(client, groups)
+    groups = moved_groups(current, client)
     rows: List[List[Tuple[str, str]]] = []
     text_lines = [
         "🗂 <b>Сделки, которые когда-либо уходили из исходной воронки</b>",
@@ -877,24 +936,20 @@ def moved_overview(force_sync: bool = False) -> Tuple[str, List[List[Dict[str, s
         "",
         "Выбери этап, чтобы увидеть сделки со ссылками.",
     ]
-    for (pipeline_id, status_id), leads in sorted(groups.items(), key=lambda item: len(item[1]), reverse=True):
-        label = labels[(pipeline_id, status_id)]
-        rows.append([(f"{label} · {len(leads)}", f"mv:{pipeline_id}:{status_id}:0")])
+    for group_key, group in sorted(groups.items(), key=lambda item: len(item[1]["leads"]), reverse=True):
+        rows.append([(f"{group['label']} · {len(group['leads'])}", f"mvg:{group_key}:0")])
     rows.append([("Обновить", "moved_refresh")])
     rows.append([("← Главное меню", "menu")])
     return "\n".join(text_lines), keyboard(rows)
 
 
-def moved_stage_text(pipeline_id: int, status_id: int, page: int) -> Tuple[str, List[List[Dict[str, str]]]]:
+def moved_stage_text(group_key: str, page: int) -> Tuple[str, List[List[Dict[str, str]]]]:
     ids = source_history_ids()
     client = amo()
-    leads = [
-        lead
-        for lead in client.get_leads_by_ids(ids)
-        if int(lead["pipeline_id"]) == int(pipeline_id) and int(lead["status_id"]) == int(status_id)
-    ]
-    leads.sort(key=lambda item: (lead_number(item) or 0, int(item["id"])), reverse=True)
-    title = f"{client.pipeline_name(pipeline_id)} → {client.status_name(pipeline_id, status_id)}"
+    groups = moved_groups(client.get_leads_by_ids(ids), client)
+    group = groups.get(group_key, {"label": "Сделки", "leads": []})
+    leads = group["leads"]
+    title = group["label"]
     per_page = 10
     pages = max(1, (len(leads) + per_page - 1) // per_page)
     page = max(0, min(page, pages - 1))
@@ -909,9 +964,9 @@ def moved_stage_text(pipeline_id: int, status_id: int, page: int) -> Tuple[str, 
 
     nav: List[Tuple[str, str]] = []
     if page > 0:
-        nav.append(("← Назад", f"mv:{pipeline_id}:{status_id}:{page - 1}"))
+        nav.append(("← Назад", f"mvg:{group_key}:{page - 1}"))
     if page < pages - 1:
-        nav.append(("Вперёд →", f"mv:{pipeline_id}:{status_id}:{page + 1}"))
+        nav.append(("Вперёд →", f"mvg:{group_key}:{page + 1}"))
     rows = []
     if nav:
         rows.append(nav)
@@ -1158,9 +1213,11 @@ def handle_callback(update: Dict[str, Any], tg: TelegramClient) -> None:
     elif data in {"moved", "moved_refresh"}:
         text, kb = moved_overview(force_sync=data == "moved_refresh")
         render(text, kb)
-    elif data.startswith("mv:"):
-        _, pipeline_id, status_id, page = data.split(":")
-        text, kb = moved_stage_text(int(pipeline_id), int(status_id), int(page))
+    elif data.startswith("mvg:"):
+        parts = data.split(":")
+        page = int(parts[-1])
+        group_key = ":".join(parts[1:-1])
+        text, kb = moved_stage_text(group_key, page)
         render(text, kb)
     elif data == "run_now":
         render("⏳ Перевожу сделки. Обычно это занимает несколько секунд...", keyboard([[("← Главное меню", "menu")]]))
