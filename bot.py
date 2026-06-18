@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 import traceback
+from socket import timeout as SocketTimeout
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -90,8 +91,8 @@ def http_json(
     url: str,
     headers: Optional[Dict[str, str]] = None,
     payload: Optional[Any] = None,
-    timeout: int = 40,
-    retries: int = 2,
+    timeout: int = 60,
+    retries: int = 3,
 ) -> Any:
     body = None
     request_headers = dict(headers or {})
@@ -113,11 +114,11 @@ def http_json(
                 time.sleep(max(retry_after, 2))
                 continue
             raise ApiError(f"{method} {url} -> {exc.code}: {text}") from exc
-        except URLError as exc:
+        except (TimeoutError, SocketTimeout, URLError) as exc:
             if attempt < retries:
-                time.sleep(2)
+                time.sleep(min(2 * (attempt + 1), 8))
                 continue
-            raise ApiError(f"{method} {url} -> {exc}") from exc
+            raise ApiError(f"{method} {url} -> network timeout or connection error: {exc}") from exc
 
 
 class AmoClient:
@@ -1354,6 +1355,8 @@ def notify_admins(tg: TelegramClient, text: str) -> None:
             continue
         try:
             tg.send(int(part), text, main_menu())
+        except ApiError as exc:
+            print(f"Telegram notify error: {exc}")
         except Exception:
             traceback.print_exc()
 
@@ -1366,9 +1369,12 @@ def scheduler_loop(tg: TelegramClient) -> None:
             today = current.strftime("%Y-%m-%d")
             current_hm = current.strftime("%H:%M")
             if current_hm == scheduled and get_setting("last_auto_run_date") != today:
-                set_setting("last_auto_run_date", today)
                 run_id, message = perform_transfer("auto")
+                set_setting("last_auto_run_date", today)
                 notify_admins(tg, f"✅ Автозапуск #{run_id}\n\n{esc(message)}")
+        except ApiError as exc:
+            print(f"Scheduler API error: {exc}")
+            notify_admins(tg, "⚠️ Ошибка автозапуска\n\n" + esc(str(exc)))
         except Exception as exc:
             notify_admins(tg, "⚠️ Ошибка автозапуска\n\n" + esc(str(exc)))
         time.sleep(20)
@@ -1387,7 +1393,10 @@ def poll_loop(tg: TelegramClient) -> None:
                     elif "callback_query" in update:
                         handle_callback(update, tg)
                 except Exception as exc:
-                    traceback.print_exc()
+                    if isinstance(exc, ApiError):
+                        print(f"Update handling API error: {exc}")
+                    else:
+                        traceback.print_exc()
                     chat = update.get("message", {}).get("chat") or update.get("callback_query", {}).get("message", {}).get("chat")
                     if chat:
                         callback_message = update.get("callback_query", {}).get("message")
@@ -1400,6 +1409,9 @@ def poll_loop(tg: TelegramClient) -> None:
                             )
                         else:
                             tg.send(int(chat["id"]), "⚠️ Ошибка\n\n" + esc(str(exc)), main_menu())
+        except ApiError as exc:
+            print(f"Polling API error: {exc}")
+            time.sleep(5)
         except Exception:
             traceback.print_exc()
             time.sleep(5)
