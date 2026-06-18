@@ -906,12 +906,17 @@ def moved_groups(current: List[Dict[str, Any]], client: AmoClient) -> Dict[str, 
     for (pipeline_id, status_id), leads in raw_groups.items():
         pipeline_name, status_name = labels[(pipeline_id, status_id)].split(" → ", 1)
         group_key, group_label = moved_group_key(pipeline_name, status_name, pipeline_id, status_id)
+        stage_key = f"actual:{pipeline_id}:{status_id}"
+        stage_label = f"{pipeline_name} → {status_name}"
         if group_key not in result:
-            result[group_key] = {"label": group_label, "leads": [], "sort": 0}
+            result[group_key] = {"label": group_label, "leads": [], "stages": {}, "sort": 0}
         result[group_key]["leads"].extend(leads)
+        result[group_key]["stages"][stage_key] = {"label": stage_label, "leads": list(leads)}
 
     for group in result.values():
         group["leads"].sort(key=lambda item: (lead_number(item) or 0, int(item["id"])), reverse=True)
+        for stage in group["stages"].values():
+            stage["leads"].sort(key=lambda item: (lead_number(item) or 0, int(item["id"])), reverse=True)
     return result
 
 
@@ -937,19 +942,56 @@ def moved_overview(force_sync: bool = False) -> Tuple[str, List[List[Dict[str, s
         "Выбери этап, чтобы увидеть сделки со ссылками.",
     ]
     for group_key, group in sorted(groups.items(), key=lambda item: len(item[1]["leads"]), reverse=True):
-        rows.append([(f"{group['label']} · {len(group['leads'])}", f"mvg:{group_key}:0")])
+        callback = f"mvsub:{group_key}" if group_key.startswith("group:") else f"mvg:{group_key}:0"
+        rows.append([(f"{group['label']} · {len(group['leads'])}", callback)])
     rows.append([("Обновить", "moved_refresh")])
     rows.append([("← Главное меню", "menu")])
     return "\n".join(text_lines), keyboard(rows)
+
+
+def moved_group_stages_text(group_key: str) -> Tuple[str, List[List[Dict[str, str]]]]:
+    ids = source_history_ids()
+    client = amo()
+    groups = moved_groups(client.get_leads_by_ids(ids), client)
+    group = groups.get(group_key)
+    if not group:
+        return "Раздел не найден. Обнови список этапов.", keyboard([[("← К этапам", "moved")]])
+
+    rows: List[List[Tuple[str, str]]] = []
+    for stage_key, stage in sorted(group["stages"].items(), key=lambda item: len(item[1]["leads"]), reverse=True):
+        rows.append([(f"{stage['label']} · {len(stage['leads'])}", f"mvg:{stage_key}:0")])
+    rows.append([("← К этапам", "moved")])
+
+    text = (
+        f"🗂 <b>{esc(group['label'])}</b>\n\n"
+        f"Всего сделок: <b>{len(group['leads'])}</b>\n\n"
+        "Выбери этап, чтобы увидеть сделки со ссылками."
+    )
+    return text, keyboard(rows)
 
 
 def moved_stage_text(group_key: str, page: int) -> Tuple[str, List[List[Dict[str, str]]]]:
     ids = source_history_ids()
     client = amo()
     groups = moved_groups(client.get_leads_by_ids(ids), client)
-    group = groups.get(group_key, {"label": "Сделки", "leads": []})
-    leads = group["leads"]
-    title = group["label"]
+    group = groups.get(group_key)
+    parent_group_key = None
+    if group:
+        leads = group["leads"]
+        title = group["label"]
+    else:
+        stage = None
+        for candidate_key, candidate in groups.items():
+            if group_key in candidate["stages"]:
+                stage = candidate["stages"][group_key]
+                parent_group_key = candidate_key
+                break
+        if stage:
+            leads = stage["leads"]
+            title = stage["label"]
+        else:
+            leads = []
+            title = "Сделки"
     per_page = 10
     pages = max(1, (len(leads) + per_page - 1) // per_page)
     page = max(0, min(page, pages - 1))
@@ -970,7 +1012,10 @@ def moved_stage_text(group_key: str, page: int) -> Tuple[str, List[List[Dict[str
     rows = []
     if nav:
         rows.append(nav)
-    rows.append([("← К этапам", "moved")])
+    if parent_group_key and parent_group_key.startswith("group:"):
+        rows.append([("← К этапам раздела", f"mvsub:{parent_group_key}")])
+    else:
+        rows.append([("← К этапам", "moved")])
     return "\n".join(lines), keyboard(rows)
 
 
@@ -1213,11 +1258,18 @@ def handle_callback(update: Dict[str, Any], tg: TelegramClient) -> None:
     elif data in {"moved", "moved_refresh"}:
         text, kb = moved_overview(force_sync=data == "moved_refresh")
         render(text, kb)
+    elif data.startswith("mvsub:"):
+        group_key = data.removeprefix("mvsub:")
+        text, kb = moved_group_stages_text(group_key)
+        render(text, kb)
     elif data.startswith("mvg:"):
         parts = data.split(":")
         page = int(parts[-1])
         group_key = ":".join(parts[1:-1])
-        text, kb = moved_stage_text(group_key, page)
+        if group_key.startswith("group:"):
+            text, kb = moved_group_stages_text(group_key)
+        else:
+            text, kb = moved_stage_text(group_key, page)
         render(text, kb)
     elif data == "run_now":
         render("⏳ Перевожу сделки. Обычно это занимает несколько секунд...", keyboard([[("← Главное меню", "menu")]]))
