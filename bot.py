@@ -8,7 +8,7 @@ import time
 import traceback
 from socket import timeout as SocketTimeout
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -26,6 +26,9 @@ ENV_PATH = ROOT / ".env"
 DB_PATH = ROOT / "bot_data.sqlite3"
 KRASNOYARSK_TZ = "Asia/Krasnoyarsk"
 DB_INIT_LOCK = threading.RLock()
+MOVED_CACHE_LOCK = threading.RLock()
+MOVED_CACHE_TTL_SECONDS = 300
+MOVED_CACHE: Dict[str, Any] = {"expires_at": 0.0, "ids": [], "current": [], "groups": {}}
 
 SOURCE_PIPELINE_DEFAULT = 10915210
 SOURCE_STATUS_DEFAULT = 85847182
@@ -63,10 +66,47 @@ def load_env(path: Path) -> Dict[str, str]:
 ENV = load_env(ENV_PATH)
 
 
-def now_local() -> datetime:
+def local_tz() -> timezone:
     if ZoneInfo:
-        return datetime.now(ZoneInfo(KRASNOYARSK_TZ))
-    return datetime.utcnow()
+        return ZoneInfo(KRASNOYARSK_TZ)
+    return timezone(timedelta(hours=7))
+
+
+def now_local() -> datetime:
+    return datetime.now(local_tz())
+
+
+def utc_dt(value: str) -> datetime:
+    raw = str(value or "").strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def utc_iso_from_dt(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0).isoformat() + "Z"
+
+
+def local_day_bounds_utc(local_day: Optional[Any] = None) -> Tuple[str, str]:
+    day = local_day or now_local().date()
+    start_local = datetime.combine(day, datetime.min.time()).replace(tzinfo=local_tz())
+    end_local = start_local + timedelta(days=1)
+    return utc_iso_from_dt(start_local), utc_iso_from_dt(end_local)
+
+
+def format_local_timestamp(value: str) -> str:
+    try:
+        return utc_dt(value).astimezone(local_tz()).strftime("%Y-%m-%d %H:%M:%S GMT+7")
+    except Exception:
+        return str(value)
+
+
+def is_weekend_local(value: Optional[datetime] = None) -> bool:
+    current = value or now_local()
+    return current.astimezone(local_tz()).weekday() >= 5
 
 
 def utc_iso() -> str:
@@ -515,7 +555,7 @@ def summary_text() -> str:
     return (
         "⚙️ <b>Настройки переводов</b>\n\n"
         f"{format_route(client)}\n\n"
-        f"<b>Время</b>\n{esc(get_setting('schedule_time'))} по Красноярску\n\n"
+        f"<b>Время</b>\n{esc(get_setting('schedule_time'))} GMT+7\n\n"
         "<b>Менеджеры</b>\n" + "\n".join(mgr_lines)
     )
 
@@ -547,6 +587,19 @@ def finish_run(run_id: int, status: str, message: str) -> None:
             "UPDATE runs SET finished_at = ?, status = ?, message = ? WHERE id = ?",
             (utc_iso(), status, message, run_id),
         )
+
+
+def run_status(run_id: int) -> str:
+    with db() as conn:
+        row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return row["status"] if row else "unknown"
+
+
+def run_title(run_id: int, auto: bool = False) -> str:
+    status = run_status(run_id)
+    mark = {"done": "✅", "blocked": "🛑", "empty": "▫️", "error": "⚠️", "running": "⏳"}.get(status, "•")
+    label = "Автозапуск" if auto else "Запуск"
+    return f"{mark} {label} #{run_id}"
 
 
 def record_transfer(run_id: int, lead: Dict[str, Any], manager: sqlite3.Row, cfg: Dict[str, int]) -> None:
@@ -604,13 +657,13 @@ def daily_transfer_capacity(active_managers: Optional[List[sqlite3.Row]] = None)
     return sum(max(0, int(manager["daily_limit"])) for manager in selected)
 
 
-def transfers_in_last_24h() -> int:
-    cutoff = (datetime.utcnow() - timedelta(hours=24)).replace(microsecond=0).isoformat() + "Z"
+def transfers_on_local_date(local_day: Optional[Any] = None) -> int:
+    start_utc, end_utc = local_day_bounds_utc(local_day)
     with db() as conn:
         return int(
             conn.execute(
-                "SELECT COUNT(*) FROM transfers WHERE moved_at >= ?",
-                (cutoff,),
+                "SELECT COUNT(*) FROM transfers WHERE moved_at >= ? AND moved_at < ?",
+                (start_utc, end_utc),
             ).fetchone()[0]
         )
 
@@ -620,19 +673,24 @@ def perform_transfer(trigger: str = "manual") -> Tuple[int, str]:
         raise RuntimeError("Перевод уже выполняется")
     try:
         cfg = config()
-        active_managers = managers(enabled_only=True)
-        if not active_managers:
-            raise RuntimeError("Нет активных менеджеров")
-
-        client = amo()
         run_id = start_run(trigger, cfg)
         try:
+            if is_weekend_local():
+                message = "Сегодня выходной по GMT+7. Переводы сделок в субботу и воскресенье заблокированы."
+                finish_run(run_id, "blocked", message)
+                return run_id, message
+
+            active_managers = managers(enabled_only=True)
+            if not active_managers:
+                raise RuntimeError("Нет активных менеджеров")
+
+            client = amo()
             capacity = daily_transfer_capacity(active_managers)
-            recent_count = transfers_in_last_24h()
-            if recent_count > 0:
+            today_count = transfers_on_local_date()
+            if today_count > 0:
                 message = (
-                    "За последние 24 часа перевод уже выполнялся. "
-                    f"Уже переведено: {recent_count}. Лимит на одну итерацию: {capacity}. "
+                    "Сегодня по GMT+7 перевод уже выполнялся. "
+                    f"Уже переведено: {today_count}. Лимит на одну итерацию: {capacity}. "
                     "Новая итерация заблокирована."
                 )
                 finish_run(run_id, "blocked", message)
@@ -672,6 +730,7 @@ def perform_transfer(trigger: str = "manual") -> Tuple[int, str]:
             client.move_leads(payload)
             for lead, manager in assignments:
                 record_transfer(run_id, lead, manager, cfg)
+            clear_moved_cache()
 
             total = len(assignments)
             by_manager: Dict[str, int] = {}
@@ -700,8 +759,8 @@ def monitoring_text() -> str:
         by_manager = conn.execute(
             "SELECT responsible_name, COUNT(*) count FROM transfers GROUP BY responsible_user_id, responsible_name ORDER BY count DESC"
         ).fetchall()
-    last_24h = transfers_in_last_24h()
-    capacity_24h = daily_transfer_capacity()
+    today_count = transfers_on_local_date()
+    daily_capacity = daily_transfer_capacity()
 
     try:
         source_count = len(client.list_leads_by_status(cfg["source_pipeline_id"], cfg["source_status_id"]))
@@ -716,7 +775,7 @@ def monitoring_text() -> str:
     run_lines = []
     for run in last_runs:
         mark = {"done": "✅", "error": "⚠️", "running": "⏳", "empty": "▫️", "blocked": "🛑"}.get(run["status"], "•")
-        run_lines.append(f"{mark} #{run['id']} {esc(run['started_at'])} · {esc(run['message'] or run['status'])}")
+        run_lines.append(f"{mark} #{run['id']} {esc(format_local_timestamp(run['started_at']))} · {esc(run['message'] or run['status'])}")
     if not run_lines:
         run_lines.append("Пока запусков не было")
 
@@ -726,7 +785,7 @@ def monitoring_text() -> str:
         "📊 <b>Мониторинг</b>\n\n"
         f"Всего переводов ботом: <b>{total}</b>\n"
         f"Уникальных сделок: <b>{unique_total}</b>\n"
-        f"За последние 24 часа: <b>{last_24h}</b> из <b>{capacity_24h}</b>\n"
+        f"За сегодня (GMT+7): <b>{today_count}</b> из <b>{daily_capacity}</b>\n"
         f"В исходном этапе сейчас: <b>{source_text}</b>\n"
         f"В целевом этапе сейчас: <b>{dest_text}</b>\n\n"
         "<b>По менеджерам</b>\n"
@@ -921,18 +980,54 @@ def moved_groups(current: List[Dict[str, Any]], client: AmoClient) -> Dict[str, 
     return result
 
 
-def moved_overview(force_sync: bool = False) -> Tuple[str, List[List[Dict[str, str]]]]:
+def clear_moved_cache() -> None:
+    with MOVED_CACHE_LOCK:
+        MOVED_CACHE.update({"expires_at": 0.0, "ids": [], "current": [], "groups": {}})
+
+
+def moved_snapshot(force_sync: bool = False) -> Tuple[List[int], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    if force_sync:
+        clear_moved_cache()
+
     sync_source_history_from_amo(force=force_sync)
+    now = time.monotonic()
+    with MOVED_CACHE_LOCK:
+        if not force_sync and MOVED_CACHE["expires_at"] > now:
+            return (
+                list(MOVED_CACHE["ids"]),
+                list(MOVED_CACHE["current"]),
+                dict(MOVED_CACHE["groups"]),
+            )
+
     ids = source_history_ids()
+    if not ids:
+        current: List[Dict[str, Any]] = []
+        groups: Dict[str, Dict[str, Any]] = {}
+    else:
+        client = amo()
+        current = client.get_leads_by_ids(ids)
+        groups = moved_groups(current, client)
+
+    with MOVED_CACHE_LOCK:
+        MOVED_CACHE.update(
+            {
+                "expires_at": now + MOVED_CACHE_TTL_SECONDS,
+                "ids": list(ids),
+                "current": list(current),
+                "groups": dict(groups),
+            }
+        )
+    return ids, current, groups
+
+
+def moved_overview(force_sync: bool = False) -> Tuple[str, List[List[Dict[str, str]]]]:
+    ids, current, groups = moved_snapshot(force_sync=force_sync)
     if not ids:
         return (
             "🗂 <b>Сделки из TG/Max</b>\n\n"
             "Пока не нашёл сделок, которые уходили из исходной воронки.",
             keyboard([[("← Главное меню", "menu")]]),
         )
-    client = amo()
-    current = client.get_leads_by_ids(ids)
-    groups = moved_groups(current, client)
     rows: List[List[Tuple[str, str]]] = []
     text_lines = [
         "🗂 <b>Сделки, которые когда-либо уходили из исходной воронки</b>",
@@ -951,9 +1046,7 @@ def moved_overview(force_sync: bool = False) -> Tuple[str, List[List[Dict[str, s
 
 
 def moved_group_stages_text(group_key: str) -> Tuple[str, List[List[Dict[str, str]]]]:
-    ids = source_history_ids()
-    client = amo()
-    groups = moved_groups(client.get_leads_by_ids(ids), client)
+    _, _, groups = moved_snapshot()
     group = groups.get(group_key)
     if not group:
         return "Раздел не найден. Обнови список этапов.", keyboard([[("← К этапам", "moved")]])
@@ -972,9 +1065,8 @@ def moved_group_stages_text(group_key: str) -> Tuple[str, List[List[Dict[str, st
 
 
 def moved_stage_text(group_key: str, page: int) -> Tuple[str, List[List[Dict[str, str]]]]:
-    ids = source_history_ids()
+    _, _, groups = moved_snapshot()
     client = amo()
-    groups = moved_groups(client.get_leads_by_ids(ids), client)
     group = groups.get(group_key)
     parent_group_key = None
     if group:
@@ -1140,7 +1232,7 @@ def handle_state(chat_id: int, text: str, tg: TelegramClient, incoming_message_i
             return True
         set_setting("schedule_time", f"{hour:02d}:{minute:02d}")
         clear_state(chat_id)
-        respond(f"Готово. Новое время: <b>{hour:02d}:{minute:02d}</b> по Красноярску.", admin_menu())
+        respond(f"Готово. Новое время: <b>{hour:02d}:{minute:02d}</b> GMT+7.", admin_menu())
         return True
 
     if state_name == "set_count":
@@ -1224,7 +1316,7 @@ def handle_message(update: Dict[str, Any], tg: TelegramClient) -> None:
         tg.send(chat_id, "Добро пожаловать. Здесь всё самое нужное для аккуратной раздачи сделок.", main_menu())
     elif text.startswith("/run"):
         run_id, message_out = perform_transfer("manual")
-        tg.send(chat_id, f"✅ Запуск #{run_id}\n\n{esc(message_out)}", main_menu())
+        tg.send(chat_id, f"{run_title(run_id)}\n\n{esc(message_out)}", main_menu())
     else:
         tg.send(chat_id, "Выбери действие.", main_menu())
 
@@ -1275,7 +1367,7 @@ def handle_callback(update: Dict[str, Any], tg: TelegramClient) -> None:
     elif data == "run_now":
         render("⏳ Перевожу сделки. Обычно это занимает несколько секунд...", keyboard([[("← Главное меню", "menu")]]))
         run_id, message_out = perform_transfer("manual")
-        render(f"✅ Запуск #{run_id}\n\n{esc(message_out)}", main_menu())
+        render(f"{run_title(run_id)}\n\n{esc(message_out)}", main_menu())
     elif data == "mgrs":
         text, kb = managers_text()
         render(text, kb)
@@ -1338,7 +1430,7 @@ def handle_callback(update: Dict[str, Any], tg: TelegramClient) -> None:
     elif data == "sched":
         set_state(chat_id, "set_time", {"message_id": message_id})
         render(
-            f"Сейчас: <b>{esc(get_setting('schedule_time'))}</b> по Красноярску.\n"
+            f"Сейчас: <b>{esc(get_setting('schedule_time'))}</b> GMT+7.\n"
             "Пришли новое время в формате <code>09:00</code>.\n"
             "Отмена: <code>/cancel</code>",
             keyboard([[("← Админ", "admin")]]),
@@ -1371,7 +1463,7 @@ def scheduler_loop(tg: TelegramClient) -> None:
             if current_hm == scheduled and get_setting("last_auto_run_date") != today:
                 run_id, message = perform_transfer("auto")
                 set_setting("last_auto_run_date", today)
-                notify_admins(tg, f"✅ Автозапуск #{run_id}\n\n{esc(message)}")
+                notify_admins(tg, f"{run_title(run_id, auto=True)}\n\n{esc(message)}")
         except ApiError as exc:
             print(f"Scheduler API error: {exc}")
             notify_admins(tg, "⚠️ Ошибка автозапуска\n\n" + esc(str(exc)))
