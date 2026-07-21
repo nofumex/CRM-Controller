@@ -1,4 +1,5 @@
 import html
+from http.client import RemoteDisconnected
 import json
 import os
 import re
@@ -26,20 +27,17 @@ ENV_PATH = ROOT / ".env"
 DB_PATH = ROOT / "bot_data.sqlite3"
 KRASNOYARSK_TZ = "Asia/Krasnoyarsk"
 DB_INIT_LOCK = threading.RLock()
-MOVED_CACHE_LOCK = threading.RLock()
-MOVED_CACHE_TTL_SECONDS = 300
-MOVED_CACHE: Dict[str, Any] = {"expires_at": 0.0, "ids": [], "current": [], "groups": {}}
+SNAPSHOT_REFRESH_SECONDS = 15 * 60
+SNAPSHOT_REFRESH_LOCK = threading.Lock()
 
-SOURCE_PIPELINE_DEFAULT = 10915210
-SOURCE_STATUS_DEFAULT = 85847182
-DEST_PIPELINE_DEFAULT = 867829
-DEST_STATUS_DEFAULT = 86529234
+REFERRAL_PIPELINE_IDS = (10915210, 10948422)
+JUDICIAL_PIPELINE_ID = 11037010
 
-DEFAULT_MANAGERS = [
-    (3298921, "Ольга Шевелева", 15, 1, 10),
-    (7074220, "Дегтярева Юлия", 15, 1, 20),
-    (2328073, "Павел", 15, 1, 30),
-]
+SOURCE_LABELS = {
+    "court": "Клиенты по судебному приказу",
+    "agents": "Заявки от агентов реферальной программы",
+    "lawyers": "Контакты от юристов",
+}
 
 SALES_GROUP_STATUSES = {
     "не смог реализовать",
@@ -154,7 +152,7 @@ def http_json(
                 time.sleep(max(retry_after, 2))
                 continue
             raise ApiError(f"{method} {url} -> {exc.code}: {text}") from exc
-        except (TimeoutError, SocketTimeout, URLError) as exc:
+        except (TimeoutError, SocketTimeout, URLError, RemoteDisconnected) as exc:
             if attempt < retries:
                 time.sleep(min(2 * (attempt + 1), 8))
                 continue
@@ -227,7 +225,7 @@ class AmoClient:
                 ("limit", 250),
                 ("page", page),
             ]
-            data = self.get("/api/v4/leads", params)
+            data = self.get("/api/v4/leads", params) or {}
             batch = data.get("_embedded", {}).get("leads", [])
             all_leads.extend(batch)
             if not data.get("_links", {}).get("next") or not batch:
@@ -239,14 +237,48 @@ class AmoClient:
         for part in chunks(lead_ids, 50):
             params: List[Tuple[str, Any]] = [("limit", 250)]
             params.extend(("filter[id][]", lead_id) for lead_id in part)
-            data = self.get("/api/v4/leads", params)
+            data = self.get("/api/v4/leads", params) or {}
             found.extend(data.get("_embedded", {}).get("leads", []))
         return found
 
-    def move_leads(self, payload: List[Dict[str, Any]]) -> None:
-        for part in chunks(payload, 50):
-            self.patch("/api/v4/leads", part)
-            time.sleep(0.25)
+    def list_pipeline_leads(self, pipeline_id: int, with_contacts: bool = False) -> List[Dict[str, Any]]:
+        pipeline = self.get_pipeline(pipeline_id)
+        found: Dict[int, Dict[str, Any]] = {}
+        for status in pipeline.get("_embedded", {}).get("statuses", []):
+            page = 1
+            while True:
+                params: List[Tuple[str, Any]] = [
+                    ("filter[statuses][0][pipeline_id]", pipeline_id),
+                    ("filter[statuses][0][status_id]", int(status["id"])),
+                    ("limit", 250),
+                    ("page", page),
+                ]
+                if with_contacts:
+                    params.append(("with", "contacts"))
+                data = self.get("/api/v4/leads", params) or {}
+                batch = data.get("_embedded", {}).get("leads", [])
+                for lead in batch:
+                    found[int(lead["id"])] = lead
+                if not batch or not data.get("_links", {}).get("next"):
+                    break
+                page += 1
+        return list(found.values())
+
+    def get_contacts_by_ids(self, contact_ids: Iterable[int]) -> List[Dict[str, Any]]:
+        found: List[Dict[str, Any]] = []
+        for part in chunks(sorted(set(int(value) for value in contact_ids)), 50):
+            params: List[Tuple[str, Any]] = [("limit", 250), ("with", "leads")]
+            params.extend(("filter[id][]", contact_id) for contact_id in part)
+            data = self.get("/api/v4/contacts", params) or {}
+            found.extend(data.get("_embedded", {}).get("contacts", []))
+        return found
+
+    def find_contacts(self, query: str) -> List[Dict[str, Any]]:
+        data = self.get(
+            "/api/v4/contacts",
+            [("query", query), ("limit", 250), ("with", "leads")],
+        ) or {}
+        return data.get("_embedded", {}).get("contacts", [])
 
 
 class TelegramClient:
@@ -322,12 +354,13 @@ def ensure_db_ready() -> None:
     with DB_INIT_LOCK:
         conn = sqlite3.connect(DB_PATH)
         try:
-            row = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
-            ).fetchone()
+            required = {"settings", "monitor_snapshots"}
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('settings', 'monitor_snapshots')"
+            ).fetchall()
         finally:
             conn.close()
-        if not row:
+        if {row[0] for row in rows} != required:
             init_db()
 
 
@@ -392,29 +425,15 @@ def init_db() -> None:
                 state TEXT NOT NULL,
                 payload TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS monitor_snapshots (
+                source_key TEXT PRIMARY KEY,
+                refreshed_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                error TEXT
+            );
             """
             )
-            defaults = {
-                "source_pipeline_id": str(SOURCE_PIPELINE_DEFAULT),
-                "source_status_id": str(SOURCE_STATUS_DEFAULT),
-                "dest_pipeline_id": str(DEST_PIPELINE_DEFAULT),
-                "dest_status_id": str(DEST_STATUS_DEFAULT),
-                "schedule_time": "09:00",
-                "timezone": KRASNOYARSK_TZ,
-                "last_auto_run_date": "",
-                "source_history_last_sync_at": "0",
-                "source_history_last_checked_at": "0",
-            }
-            for key, value in defaults.items():
-                conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)", (key, value))
-            existing = conn.execute("SELECT COUNT(*) FROM managers").fetchone()[0]
-            if existing == 0:
-                conn.executemany(
-                    "INSERT INTO managers(user_id, name, daily_limit, enabled, sort_order) VALUES(?, ?, ?, ?, ?)",
-                    DEFAULT_MANAGERS,
-                )
-
-
 def get_setting(key: str) -> str:
     ensure_db_ready()
     with db() as conn:
@@ -497,29 +516,9 @@ def show(
 def main_menu() -> List[List[Dict[str, str]]]:
     return keyboard(
         [
-            [("📊 Мониторинг", "mon"), ("🗂 Сделки из TG/Max", "moved")],
-            [("⚙️ Админ-панель", "admin")],
-            [("▶️ Перевести сейчас", "run_now")],
-        ]
-    )
-
-
-def admin_menu() -> List[List[Dict[str, str]]]:
-    return keyboard(
-        [
-            [("👥 Менеджеры", "mgrs"), ("🧭 Маршрут", "route")],
-            [("⏰ Время", "sched"), ("📋 Сводка", "summary")],
-            [("← Главное меню", "menu")],
-        ]
-    )
-
-
-def route_menu() -> List[List[Dict[str, str]]]:
-    return keyboard(
-        [
-            [("Откуда", "route:src"), ("Куда", "route:dst")],
-            [("Ввести ID вручную", "route:manual")],
-            [("← Админ", "admin")],
+            [("⚖️ Клиенты по судебному приказу", "source:court")],
+            [("🤝 Заявки от агентов", "source:agents")],
+            [("🧑‍⚖️ Контакты от юристов", "source:lawyers")],
         ]
     )
 
@@ -801,9 +800,19 @@ def transferred_ids() -> List[int]:
         return [int(row["lead_id"]) for row in rows]
 
 
-def source_history_ids() -> List[int]:
+def source_history_ids(pipeline_ids: Optional[Iterable[int]] = None) -> List[int]:
+    params: Tuple[Any, ...] = ()
+    where = ""
+    selected = tuple(int(value) for value in (pipeline_ids or []))
+    if selected:
+        placeholders = ",".join("?" for _ in selected)
+        where = f" WHERE source_pipeline_id IN ({placeholders})"
+        params = selected
     with db() as conn:
-        rows = conn.execute("SELECT lead_id FROM source_history_leads ORDER BY lead_id DESC").fetchall()
+        rows = conn.execute(
+            f"SELECT lead_id FROM source_history_leads{where} ORDER BY lead_id DESC",
+            params,
+        ).fetchall()
         return [int(row["lead_id"]) for row in rows]
 
 
@@ -863,22 +872,14 @@ def seed_source_history_from_transfers() -> None:
         )
 
 
-def sync_source_history_from_amo(force: bool = False) -> int:
-    cfg = config()
-    client = amo()
-    checked_at = int(get_setting("source_history_last_checked_at") or "0")
-    now_ts = int(time.time())
-    if not force and checked_at and now_ts - checked_at < 300:
-        return 0
-
-    pipeline = client.get_pipeline(cfg["source_pipeline_id"])
+def sync_source_history_from_amo(client: AmoClient, pipeline_id: int) -> int:
+    pipeline = client.get_pipeline(pipeline_id)
     statuses = pipeline.get("_embedded", {}).get("statuses", [])
-    last_sync = int(get_setting("source_history_last_sync_at") or "0")
+    setting_key = f"source_history_last_sync_at_{pipeline_id}"
+    last_sync = int(get_setting(setting_key) or "0")
     from_ts = max(0, last_sync - 60) if last_sync else 0
     max_event_at = last_sync
     found = 0
-
-    seed_source_history_from_transfers()
 
     for status in statuses:
         status_id = int(status["id"])
@@ -888,7 +889,7 @@ def sync_source_history_from_amo(force: bool = False) -> int:
                 ("limit", 250),
                 ("page", page),
                 ("filter[type]", "lead_status_changed"),
-                ("filter[value_before][leads_statuses][0][pipeline_id]", cfg["source_pipeline_id"]),
+                ("filter[value_before][leads_statuses][0][pipeline_id]", pipeline_id),
                 ("filter[value_before][leads_statuses][0][status_id]", status_id),
             ]
             if from_ts:
@@ -898,13 +899,13 @@ def sync_source_history_from_amo(force: bool = False) -> int:
             events = data.get("_embedded", {}).get("events", [])
             for event in events:
                 before = event_status(event, "value_before")
-                if not before or before["pipeline_id"] != cfg["source_pipeline_id"]:
+                if not before or before["pipeline_id"] != pipeline_id:
                     continue
                 event_at = int(event.get("created_at") or 0)
                 max_event_at = max(max_event_at, event_at)
                 remember_source_history_lead(
                     int(event["entity_id"]),
-                    cfg["source_pipeline_id"],
+                    pipeline_id,
                     before["status_id"],
                     "amo_events",
                     event_at,
@@ -916,8 +917,7 @@ def sync_source_history_from_amo(force: bool = False) -> int:
             page += 1
 
     if max_event_at > last_sync:
-        set_setting("source_history_last_sync_at", max_event_at)
-    set_setting("source_history_last_checked_at", now_ts)
+        set_setting(setting_key, max_event_at)
     return found
 
 
@@ -980,82 +980,217 @@ def moved_groups(current: List[Dict[str, Any]], client: AmoClient) -> Dict[str, 
     return result
 
 
-def clear_moved_cache() -> None:
-    with MOVED_CACHE_LOCK:
-        MOVED_CACHE.update({"expires_at": 0.0, "ids": [], "current": [], "groups": {}})
+def compact_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(lead["id"]),
+        "name": lead.get("name") or str(lead["id"]),
+        "pipeline_id": int(lead["pipeline_id"]),
+        "status_id": int(lead["status_id"]),
+    }
 
 
-def moved_snapshot(force_sync: bool = False) -> Tuple[List[int], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    if force_sync:
-        clear_moved_cache()
+def normalize_phone(value: Any) -> Optional[str]:
+    digits = re.sub(r"\D", "", str(value or ""))
+    if len(digits) == 11 and digits[0] in "78":
+        digits = digits[-10:]
+    if len(digits) != 10:
+        return None
+    return digits
 
-    sync_source_history_from_amo(force=force_sync)
-    now = time.monotonic()
-    with MOVED_CACHE_LOCK:
-        if not force_sync and MOVED_CACHE["expires_at"] > now:
-            return (
-                list(MOVED_CACHE["ids"]),
-                list(MOVED_CACHE["current"]),
-                dict(MOVED_CACHE["groups"]),
+
+def contact_phones(contact: Dict[str, Any]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for field in contact.get("custom_fields_values") or []:
+        field_code = str(field.get("field_code") or "").upper()
+        field_name = normalized_stage_name(str(field.get("field_name") or ""))
+        if field_code != "PHONE" and "телефон" not in field_name:
+            continue
+        for item in field.get("values") or []:
+            raw = str(item.get("value") or "").strip()
+            normalized = normalize_phone(raw)
+            if normalized:
+                result[normalized] = raw
+    return result
+
+
+def empty_snapshot() -> Dict[str, Any]:
+    return {"ids": [], "current": [], "groups": {}, "stats": {}}
+
+
+def save_snapshot(source_key: str, payload: Dict[str, Any]) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO monitor_snapshots(source_key, refreshed_at, payload, error)
+            VALUES(?, ?, ?, NULL)
+            ON CONFLICT(source_key) DO UPDATE SET
+                refreshed_at = excluded.refreshed_at,
+                payload = excluded.payload,
+                error = NULL
+            """,
+            (source_key, utc_iso(), json.dumps(payload, ensure_ascii=False)),
+        )
+
+
+def save_snapshot_error(source_key: str, error: Exception) -> None:
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT source_key FROM monitor_snapshots WHERE source_key = ?", (source_key,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE monitor_snapshots SET error = ? WHERE source_key = ?",
+                (str(error), source_key),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO monitor_snapshots(source_key, refreshed_at, payload, error) VALUES(?, '', ?, ?)",
+                (source_key, json.dumps(empty_snapshot()), str(error)),
             )
 
-    ids = source_history_ids()
-    if not ids:
-        current: List[Dict[str, Any]] = []
-        groups: Dict[str, Dict[str, Any]] = {}
-    else:
-        client = amo()
-        current = client.get_leads_by_ids(ids)
-        groups = moved_groups(current, client)
 
-    with MOVED_CACHE_LOCK:
-        MOVED_CACHE.update(
-            {
-                "expires_at": now + MOVED_CACHE_TTL_SECONDS,
-                "ids": list(ids),
-                "current": list(current),
-                "groups": dict(groups),
-            }
-        )
-    return ids, current, groups
+def load_snapshot(source_key: str) -> Tuple[Dict[str, Any], str, str]:
+    ensure_db_ready()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT refreshed_at, payload, error FROM monitor_snapshots WHERE source_key = ?",
+            (source_key,),
+        ).fetchone()
+    if not row:
+        return empty_snapshot(), "", ""
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except json.JSONDecodeError:
+        payload = empty_snapshot()
+    return payload, row["refreshed_at"] or "", row["error"] or ""
 
 
-def moved_overview(force_sync: bool = False) -> Tuple[str, List[List[Dict[str, str]]]]:
-    ids, current, groups = moved_snapshot(force_sync=force_sync)
-    if not ids:
-        return (
-            "🗂 <b>Сделки из TG/Max</b>\n\n"
-            "Пока не нашёл сделок, которые уходили из исходной воронки.",
-            keyboard([[("← Главное меню", "menu")]]),
-        )
-    rows: List[List[Tuple[str, str]]] = []
-    text_lines = [
-        "🗂 <b>Сделки, которые когда-либо уходили из исходной воронки</b>",
-        "",
-        f"Всего в истории: <b>{len(ids)}</b>",
-        f"Найдено сейчас в amoCRM: <b>{len(current)}</b>",
-        "",
-        "Выбери этап, чтобы увидеть сделки со ссылками.",
+def refresh_referral_snapshot(client: AmoClient) -> Dict[str, Any]:
+    for pipeline_id in REFERRAL_PIPELINE_IDS:
+        sync_source_history_from_amo(client, pipeline_id)
+        for lead in client.list_pipeline_leads(pipeline_id):
+            remember_source_history_lead(
+                int(lead["id"]), pipeline_id, int(lead["status_id"]), "current_pipeline"
+            )
+    ids = source_history_ids(REFERRAL_PIPELINE_IDS)
+    current = [
+        compact_lead(lead)
+        for lead in client.get_leads_by_ids(ids)
+        if int(lead["pipeline_id"]) not in REFERRAL_PIPELINE_IDS
+    ] if ids else []
+    return {
+        "ids": ids,
+        "current": current,
+        "groups": moved_groups(current, client),
+        "stats": {"source_pipelines": len(REFERRAL_PIPELINE_IDS)},
+    }
+
+
+def refresh_court_snapshot(client: AmoClient) -> Dict[str, Any]:
+    judicial_leads = client.list_pipeline_leads(JUDICIAL_PIPELINE_ID, with_contacts=True)
+    judicial_ids = {int(lead["id"]) for lead in judicial_leads}
+    contact_ids = {
+        int(contact["id"])
+        for lead in judicial_leads
+        for contact in lead.get("_embedded", {}).get("contacts", [])
+    }
+    phones: Dict[str, str] = {}
+    for contact in client.get_contacts_by_ids(contact_ids):
+        phones.update(contact_phones(contact))
+
+    matching_lead_ids: set[int] = set()
+    for normalized in phones:
+        for contact in client.find_contacts(normalized):
+            if normalized not in contact_phones(contact):
+                continue
+            matching_lead_ids.update(
+                int(lead["id"])
+                for lead in contact.get("_embedded", {}).get("leads", [])
+            )
+    matching_lead_ids.difference_update(judicial_ids)
+    current = [
+        compact_lead(lead)
+        for lead in client.get_leads_by_ids(sorted(matching_lead_ids))
+        if int(lead["pipeline_id"]) != JUDICIAL_PIPELINE_ID
     ]
+    ids = sorted((int(lead["id"]) for lead in current), reverse=True)
+    return {
+        "ids": ids,
+        "current": current,
+        "groups": moved_groups(current, client),
+        "stats": {
+            "judicial_deals": len(judicial_leads),
+            "phones": len(phones),
+        },
+    }
+
+
+def refresh_all_snapshots() -> None:
+    if not SNAPSHOT_REFRESH_LOCK.acquire(blocking=False):
+        return
+    try:
+        client = amo()
+        refreshers = {
+            "court": refresh_court_snapshot,
+            "agents": refresh_referral_snapshot,
+        }
+        for source_key, refresher in refreshers.items():
+            try:
+                save_snapshot(source_key, refresher(client))
+            except Exception as exc:
+                save_snapshot_error(source_key, exc)
+                print(f"Snapshot refresh error ({source_key}): {exc}")
+        save_snapshot("lawyers", empty_snapshot())
+    finally:
+        SNAPSHOT_REFRESH_LOCK.release()
+
+
+def snapshot_status_line(refreshed_at: str, error: str) -> str:
+    if not refreshed_at:
+        return "⏳ Первый снимок данных ещё формируется."
+    line = f"Обновлено: <b>{esc(format_local_timestamp(refreshed_at))}</b>"
+    if error:
+        line += "\n⚠️ Последнее обновление не удалось; показан предыдущий снимок."
+    return line
+
+
+def source_overview(source_key: str) -> Tuple[str, List[List[Dict[str, str]]]]:
+    payload, refreshed_at, error = load_snapshot(source_key)
+    label = SOURCE_LABELS.get(source_key, "Мониторинг клиентов")
+    groups = payload.get("groups") or {}
+    rows: List[List[Tuple[str, str]]] = []
     for group_key, group in sorted(groups.items(), key=lambda item: len(item[1]["leads"]), reverse=True):
-        callback = f"mvsub:{group_key}" if group_key.startswith("group:") else f"mvg:{group_key}:0"
+        if group_key.startswith("group:"):
+            callback = f"srcg|{source_key}|{group_key}"
+        else:
+            callback = f"srcs|{source_key}|{group_key}|0"
         rows.append([(f"{group['label']} · {len(group['leads'])}", callback)])
-    rows.append([("Обновить", "moved_refresh")])
     rows.append([("← Главное меню", "menu")])
-    return "\n".join(text_lines), keyboard(rows)
+
+    if source_key == "lawyers":
+        description = "Раздел подготовлен. Правило отбора контактов добавим позже."
+    elif groups:
+        description = "Выбери этап, чтобы увидеть сделки со ссылками."
+    else:
+        description = "В последнем снимке подходящих сделок нет."
+    text = (
+        f"🗂 <b>{esc(label)}</b>\n\n"
+        f"Сделок: <b>{len(payload.get('current') or [])}</b>\n"
+        f"{snapshot_status_line(refreshed_at, error)}\n\n"
+        f"{description}"
+    )
+    return text, keyboard(rows)
 
 
-def moved_group_stages_text(group_key: str) -> Tuple[str, List[List[Dict[str, str]]]]:
-    _, _, groups = moved_snapshot()
-    group = groups.get(group_key)
+def source_group_stages_text(source_key: str, group_key: str) -> Tuple[str, List[List[Dict[str, str]]]]:
+    payload, _, _ = load_snapshot(source_key)
+    group = (payload.get("groups") or {}).get(group_key)
     if not group:
-        return "Раздел не найден. Обнови список этапов.", keyboard([[("← К этапам", "moved")]])
-
+        return "Раздел не найден в текущем снимке.", keyboard([[("← К этапам", f"source:{source_key}")]])
     rows: List[List[Tuple[str, str]]] = []
     for stage_key, stage in sorted(group["stages"].items(), key=lambda item: len(item[1]["leads"]), reverse=True):
-        rows.append([(f"{stage['label']} · {len(stage['leads'])}", f"mvg:{stage_key}:0")])
-    rows.append([("← К этапам", "moved")])
-
+        rows.append([(f"{stage['label']} · {len(stage['leads'])}", f"srcs|{source_key}|{stage_key}|0")])
+    rows.append([("← К этапам", f"source:{source_key}")])
     text = (
         f"🗂 <b>{esc(group['label'])}</b>\n\n"
         f"Всего сделок: <b>{len(group['leads'])}</b>\n\n"
@@ -1064,51 +1199,45 @@ def moved_group_stages_text(group_key: str) -> Tuple[str, List[List[Dict[str, st
     return text, keyboard(rows)
 
 
-def moved_stage_text(group_key: str, page: int) -> Tuple[str, List[List[Dict[str, str]]]]:
-    _, _, groups = moved_snapshot()
-    client = amo()
-    group = groups.get(group_key)
-    parent_group_key = None
+def source_stage_text(source_key: str, stage_key: str, page: int) -> Tuple[str, List[List[Dict[str, str]]]]:
+    payload, _, _ = load_snapshot(source_key)
+    groups = payload.get("groups") or {}
+    group = groups.get(stage_key)
+    parent_group_key: Optional[str] = None
     if group:
-        leads = group["leads"]
-        title = group["label"]
+        leads, title = group["leads"], group["label"]
     else:
         stage = None
         for candidate_key, candidate in groups.items():
-            if group_key in candidate["stages"]:
-                stage = candidate["stages"][group_key]
+            if stage_key in candidate["stages"]:
+                stage = candidate["stages"][stage_key]
                 parent_group_key = candidate_key
                 break
-        if stage:
-            leads = stage["leads"]
-            title = stage["label"]
-        else:
-            leads = []
-            title = "Сделки"
+        leads = stage["leads"] if stage else []
+        title = stage["label"] if stage else "Сделки"
     per_page = 10
     pages = max(1, (len(leads) + per_page - 1) // per_page)
     page = max(0, min(page, pages - 1))
     part = leads[page * per_page : (page + 1) * per_page]
     lines = [f"📍 <b>{esc(title)}</b>", "", f"Сделок: <b>{len(leads)}</b>", ""]
+    base_url = ENV.get("AMOCRM_BASE_URL", "").rstrip("/")
     for lead in part:
-        num = lead_number(lead)
-        name = f"#{num}" if num else lead.get("name", lead["id"])
-        lines.append(f"• <a href=\"{esc(client.lead_url(int(lead['id'])))}\">{esc(name)}</a> · {esc(lead.get('name'))}")
+        number = lead_number(lead)
+        short_name = f"#{number}" if number else lead.get("name", lead["id"])
+        url = f"{base_url}/leads/detail/{int(lead['id'])}"
+        lines.append(f"• <a href=\"{esc(url)}\">{esc(short_name)}</a> · {esc(lead.get('name'))}")
     if not part:
         lines.append("На этой странице пусто")
-
     nav: List[Tuple[str, str]] = []
     if page > 0:
-        nav.append(("← Назад", f"mvg:{group_key}:{page - 1}"))
+        nav.append(("← Назад", f"srcs|{source_key}|{stage_key}|{page - 1}"))
     if page < pages - 1:
-        nav.append(("Вперёд →", f"mvg:{group_key}:{page + 1}"))
-    rows = []
-    if nav:
-        rows.append(nav)
-    if parent_group_key and parent_group_key.startswith("group:"):
-        rows.append([("← К этапам раздела", f"mvsub:{parent_group_key}")])
+        nav.append(("Вперёд →", f"srcs|{source_key}|{stage_key}|{page + 1}"))
+    rows: List[List[Tuple[str, str]]] = [nav] if nav else []
+    if parent_group_key:
+        rows.append([("← К этапам раздела", f"srcg|{source_key}|{parent_group_key}")])
     else:
-        rows.append([("← К этапам", "moved")])
+        rows.append([("← К этапам", f"source:{source_key}")])
     return "\n".join(lines), keyboard(rows)
 
 
@@ -1302,23 +1431,16 @@ def handle_message(update: Dict[str, Any], tg: TelegramClient) -> None:
     message = update.get("message") or {}
     chat_id = int(message.get("chat", {}).get("id"))
     user_id = int(message.get("from", {}).get("id"))
-    message_id = int(message.get("message_id", 0))
-    text = message.get("text", "").strip()
 
     if not is_admin(user_id):
         tg.send(chat_id, unauthorized_text(user_id))
         return
-
-    if handle_state(chat_id, text, tg, message_id):
-        return
-
-    if text.startswith("/start") or text.startswith("/menu"):
-        tg.send(chat_id, "Добро пожаловать. Здесь всё самое нужное для аккуратной раздачи сделок.", main_menu())
-    elif text.startswith("/run"):
-        run_id, message_out = perform_transfer("manual")
-        tg.send(chat_id, f"{run_title(run_id)}\n\n{esc(message_out)}", main_menu())
-    else:
-        tg.send(chat_id, "Выбери действие.", main_menu())
+    clear_state(chat_id)
+    tg.send(
+        chat_id,
+        "📊 <b>Мониторинг клиентских сделок</b>\n\nВыбери, откуда пришёл клиент.",
+        main_menu(),
+    )
 
 
 def handle_callback(update: Dict[str, Any], tg: TelegramClient) -> None:
@@ -1336,140 +1458,33 @@ def handle_callback(update: Dict[str, Any], tg: TelegramClient) -> None:
         render(unauthorized_text(user_id))
         return
 
-    waits_for_text = data == "mgr:add" or data.startswith("mgr:cnt:") or data == "route:manual" or data == "sched"
-    if not waits_for_text:
-        clear_state(chat_id)
-
     if data == "menu":
-        render("Главное меню.", main_menu())
-    elif data == "admin":
-        render("⚙️ <b>Админ-панель</b>", admin_menu())
-    elif data == "summary":
-        render(summary_text(), admin_menu())
-    elif data == "mon":
-        render(monitoring_text(), keyboard([[("Обновить", "mon")], [("← Главное меню", "menu")]]))
-    elif data in {"moved", "moved_refresh"}:
-        text, kb = moved_overview(force_sync=data == "moved_refresh")
+        render("📊 <b>Мониторинг клиентских сделок</b>\n\nВыбери, откуда пришёл клиент.", main_menu())
+    elif data.startswith("source:"):
+        source_key = data.split(":", 1)[1]
+        text, kb = source_overview(source_key)
         render(text, kb)
-    elif data.startswith("mvsub:"):
-        group_key = data.removeprefix("mvsub:")
-        text, kb = moved_group_stages_text(group_key)
+    elif data.startswith("srcg|"):
+        _, source_key, group_key = data.split("|", 2)
+        text, kb = source_group_stages_text(source_key, group_key)
         render(text, kb)
-    elif data.startswith("mvg:"):
-        parts = data.split(":")
-        page = int(parts[-1])
-        group_key = ":".join(parts[1:-1])
-        if group_key.startswith("group:"):
-            text, kb = moved_group_stages_text(group_key)
-        else:
-            text, kb = moved_stage_text(group_key, page)
+    elif data.startswith("srcs|"):
+        _, source_key, stage_key, page = data.split("|", 3)
+        text, kb = source_stage_text(source_key, stage_key, int(page))
         render(text, kb)
-    elif data == "run_now":
-        render("⏳ Перевожу сделки. Обычно это занимает несколько секунд...", keyboard([[("← Главное меню", "menu")]]))
-        run_id, message_out = perform_transfer("manual")
-        render(f"{run_title(run_id)}\n\n{esc(message_out)}", main_menu())
-    elif data == "mgrs":
-        text, kb = managers_text()
-        render(text, kb)
-    elif data == "mgr:add":
-        set_state(chat_id, "add_manager", {"message_id": message_id})
-        render(
-            "Пришли amoCRM ID или точное имя менеджера и лимит.\n\n"
-            "Пример: <code>7074220 15</code>\n"
-            "Отмена: <code>/cancel</code>",
-            keyboard([[("← Менеджеры", "mgrs")]]),
-        )
-    elif data.startswith("mgr:cnt:"):
-        user_id_to_change = int(data.split(":")[2])
-        set_state(chat_id, "set_count", {"user_id": user_id_to_change, "message_id": message_id})
-        render(
-            "👥 <b>Лимит менеджера</b>\n\n"
-            "Введи новый лимит сделок в день. Например: <code>15</code>\n"
-            "Отмена: <code>/cancel</code>",
-            keyboard([[("← Менеджеры", "mgrs")]]),
-        )
-    elif data.startswith("mgr:toggle:"):
-        user_id_to_toggle = int(data.split(":")[2])
-        with db() as conn:
-            conn.execute("UPDATE managers SET enabled = CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE user_id = ?", (user_id_to_toggle,))
-        text, kb = manager_detail(user_id_to_toggle)
-        render(text, kb)
-    elif data.startswith("mgr:del:"):
-        user_id_to_delete = int(data.split(":")[2])
-        with db() as conn:
-            conn.execute("DELETE FROM managers WHERE user_id = ?", (user_id_to_delete,))
-        text, kb = managers_text()
-        render("Удалено.\n\n" + text, kb)
-    elif data.startswith("mgr:"):
-        user_id_detail = int(data.split(":")[1])
-        text, kb = manager_detail(user_id_detail)
-        render(text, kb)
-    elif data == "route":
-        render("🧭 <b>Маршрут перевода</b>\n\n" + format_route(amo()), route_menu())
-    elif data in {"route:src", "route:dst"}:
-        kind = data.split(":")[1]
-        text, kb = pipelines_text(kind)
-        render(text, kb)
-    elif data == "route:manual":
-        set_state(chat_id, "route_manual", {"message_id": message_id})
-        render(
-            "Пришли ID в формате:\n"
-            "<code>pipeline_id status_id src</code> для источника\n"
-            "<code>pipeline_id status_id dst</code> для назначения\n\n"
-            "Отмена: <code>/cancel</code>",
-            keyboard([[("← Маршрут", "route")]]),
-        )
-    elif data.startswith("pl:"):
-        _, kind, pipeline_id = data.split(":")
-        text, kb = statuses_text(kind, int(pipeline_id))
-        render(text, kb)
-    elif data.startswith("st:"):
-        _, kind, pipeline_id, status_id = data.split(":")
-        message = set_route(kind, int(pipeline_id), int(status_id))
-        render(f"{message}.\n\n{summary_text()}", route_menu())
-    elif data == "sched":
-        set_state(chat_id, "set_time", {"message_id": message_id})
-        render(
-            f"Сейчас: <b>{esc(get_setting('schedule_time'))}</b> GMT+7.\n"
-            "Пришли новое время в формате <code>09:00</code>.\n"
-            "Отмена: <code>/cancel</code>",
-            keyboard([[("← Админ", "admin")]]),
-        )
     else:
         render("Не понял действие. Вернёмся в меню.", main_menu())
 
 
-def notify_admins(tg: TelegramClient, text: str) -> None:
-    raw = ENV.get("TELEGRAM_ADMIN_IDS", "").strip()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
+def snapshot_refresh_loop() -> None:
+    while True:
+        started_at = time.monotonic()
         try:
-            tg.send(int(part), text, main_menu())
-        except ApiError as exc:
-            print(f"Telegram notify error: {exc}")
+            refresh_all_snapshots()
         except Exception:
             traceback.print_exc()
-
-
-def scheduler_loop(tg: TelegramClient) -> None:
-    while True:
-        try:
-            scheduled = get_setting("schedule_time") or "09:00"
-            current = now_local()
-            today = current.strftime("%Y-%m-%d")
-            current_hm = current.strftime("%H:%M")
-            if current_hm == scheduled and get_setting("last_auto_run_date") != today:
-                run_id, message = perform_transfer("auto")
-                set_setting("last_auto_run_date", today)
-                notify_admins(tg, f"{run_title(run_id, auto=True)}\n\n{esc(message)}")
-        except ApiError as exc:
-            print(f"Scheduler API error: {exc}")
-            notify_admins(tg, "⚠️ Ошибка автозапуска\n\n" + esc(str(exc)))
-        except Exception as exc:
-            notify_admins(tg, "⚠️ Ошибка автозапуска\n\n" + esc(str(exc)))
-        time.sleep(20)
+        elapsed = time.monotonic() - started_at
+        time.sleep(max(1.0, SNAPSHOT_REFRESH_SECONDS - elapsed))
 
 
 def poll_loop(tg: TelegramClient) -> None:
@@ -1518,7 +1533,7 @@ def main() -> None:
     if not ENV.get("TELEGRAM_ADMIN_IDS", "").strip():
         print("TELEGRAM_ADMIN_IDS is missing. Add your Telegram numeric ID to .env.")
     tg = TelegramClient(token)
-    threading.Thread(target=scheduler_loop, args=(tg,), daemon=True).start()
+    threading.Thread(target=snapshot_refresh_loop, daemon=True).start()
     print("Bot started. Press Ctrl+C to stop.")
     poll_loop(tg)
 
