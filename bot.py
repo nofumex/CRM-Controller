@@ -1,5 +1,4 @@
 import html
-from http.client import RemoteDisconnected
 import json
 import os
 import re
@@ -7,14 +6,13 @@ import sqlite3
 import threading
 import time
 import traceback
-from socket import timeout as SocketTimeout
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+
+import requests
 
 try:
     from zoneinfo import ZoneInfo
@@ -29,9 +27,16 @@ KRASNOYARSK_TZ = "Asia/Krasnoyarsk"
 DB_INIT_LOCK = threading.RLock()
 SNAPSHOT_REFRESH_SECONDS = 15 * 60
 SNAPSHOT_REFRESH_LOCK = threading.Lock()
+SNAPSHOT_MEMORY_LOCK = threading.RLock()
+SNAPSHOT_MEMORY: Dict[str, Tuple[Dict[str, Any], str, str]] = {}
+DEAL_DETAIL_MEMORY_LOCK = threading.RLock()
+DEAL_DETAIL_MEMORY: Dict[int, Dict[str, Any]] = {}
 
 REFERRAL_PIPELINE_IDS = (10915210, 10948422)
 JUDICIAL_PIPELINE_ID = 11037010
+SALES_PIPELINE_ID = 867829
+SALES_FAILED_STATUS_ID = 143
+FAILED_REASON_FIELD_ID = 589709
 
 SOURCE_LABELS = {
     "court": "Клиенты по судебному приказу",
@@ -131,32 +136,35 @@ def http_json(
     payload: Optional[Any] = None,
     timeout: int = 60,
     retries: int = 3,
+    session: Optional[requests.Session] = None,
 ) -> Any:
-    body = None
     request_headers = dict(headers or {})
-    if payload is not None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request_headers.setdefault("Content-Type", "application/json")
     request_headers.setdefault("Accept", "application/json")
+    transport = session or requests.Session()
 
     for attempt in range(retries + 1):
-        req = Request(url, data=body, headers=request_headers, method=method)
         try:
-            with urlopen(req, timeout=timeout) as response:
-                text = response.read().decode("utf-8")
-                return json.loads(text) if text else None
-        except HTTPError as exc:
-            text = exc.read().decode("utf-8", errors="replace")
-            if exc.code == 429 and attempt < retries:
-                retry_after = int(exc.headers.get("Retry-After", "2"))
+            response = transport.request(
+                method,
+                url,
+                headers=request_headers,
+                json=payload,
+                timeout=timeout,
+            )
+            if response.status_code == 204:
+                return None
+            if response.status_code == 429 and attempt < retries:
+                retry_after = int(response.headers.get("Retry-After", "2"))
                 time.sleep(max(retry_after, 2))
                 continue
-            raise ApiError(f"{method} {url} -> {exc.code}: {text}") from exc
-        except (TimeoutError, SocketTimeout, URLError, RemoteDisconnected) as exc:
+            if response.status_code >= 400:
+                raise ApiError(f"{method} {url} -> {response.status_code}: {response.text}")
+            return response.json() if response.content else None
+        except requests.RequestException as exc:
             if attempt < retries:
                 time.sleep(min(2 * (attempt + 1), 8))
                 continue
-            raise ApiError(f"{method} {url} -> network timeout or connection error: {exc}") from exc
+            raise ApiError(f"{method} {url} -> network error: {exc}") from exc
 
 
 class AmoClient:
@@ -165,6 +173,8 @@ class AmoClient:
             raise ApiError("AMOCRM_BASE_URL and AMOCRM_ACCESS_TOKEN are required")
         self.base_url = base_url.rstrip("/")
         self.headers = {"Authorization": f"Bearer {token}"}
+        self.session = requests.Session()
+        self.session.trust_env = False
 
     def _url(self, path: str, params: Optional[List[Tuple[str, Any]]] = None) -> str:
         if params:
@@ -172,10 +182,10 @@ class AmoClient:
         return f"{self.base_url}{path}"
 
     def get(self, path: str, params: Optional[List[Tuple[str, Any]]] = None) -> Any:
-        return http_json("GET", self._url(path, params), self.headers)
+        return http_json("GET", self._url(path, params), self.headers, session=self.session)
 
     def patch(self, path: str, payload: Any) -> Any:
-        return http_json("PATCH", self._url(path), self.headers, payload)
+        return http_json("PATCH", self._url(path), self.headers, payload, session=self.session)
 
     def lead_url(self, lead_id: int) -> str:
         return f"{self.base_url}/leads/detail/{lead_id}"
@@ -280,15 +290,50 @@ class AmoClient:
         ) or {}
         return data.get("_embedded", {}).get("contacts", [])
 
+    def get_lead(self, lead_id: int) -> Dict[str, Any]:
+        data = self.get(f"/api/v4/leads/{lead_id}")
+        if not data:
+            raise ApiError(f"Сделка {lead_id} не найдена")
+        return data
+
+    def lead_status_events(self, lead_ids: Iterable[int]) -> List[Dict[str, Any]]:
+        all_events: Dict[str, Dict[str, Any]] = {}
+        for part in chunks(sorted(set(int(value) for value in lead_ids)), 10):
+            page = 1
+            while True:
+                params: List[Tuple[str, Any]] = [
+                    ("filter[type]", "lead_status_changed"),
+                    ("filter[entity]", "lead"),
+                    ("limit", 100),
+                    ("page", page),
+                ]
+                params.extend(("filter[entity_id][]", lead_id) for lead_id in part)
+                data = self.get("/api/v4/events", params) or {}
+                events = data.get("_embedded", {}).get("events", [])
+                for event in events:
+                    all_events[str(event["id"])] = event
+                if not events or not data.get("_links", {}).get("next"):
+                    break
+                page += 1
+        return sorted(all_events.values(), key=lambda item: (int(item.get("created_at") or 0), str(item["id"])))
+
 
 class TelegramClient:
     def __init__(self, token: str):
         if not token:
             raise ApiError("TELEGRAM_BOT_TOKEN is required")
         self.base_url = f"https://api.telegram.org/bot{token}"
+        self.session = requests.Session()
+        self.session.trust_env = False
 
-    def api(self, method: str, payload: Dict[str, Any]) -> Any:
-        return http_json("POST", f"{self.base_url}/{method}", payload=payload)
+    def api(self, method: str, payload: Dict[str, Any], retries: int = 3) -> Any:
+        return http_json(
+            "POST",
+            f"{self.base_url}/{method}",
+            payload=payload,
+            retries=retries,
+            session=self.session,
+        )
 
     def get_updates(self, offset: Optional[int]) -> List[Dict[str, Any]]:
         payload = {"timeout": 25, "allowed_updates": ["message", "callback_query"]}
@@ -324,7 +369,7 @@ class TelegramClient:
             "reply_markup": {"inline_keyboard": keyboard or []},
         }
         try:
-            self.api("editMessageText", payload)
+            self.api("editMessageText", payload, retries=0)
         except ApiError as exc:
             if "message is not modified" not in str(exc):
                 raise
@@ -336,7 +381,10 @@ class TelegramClient:
             pass
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
-        self.api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+        try:
+            self.api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text}, retries=0)
+        except ApiError:
+            pass
 
 
 @contextmanager
@@ -354,9 +402,9 @@ def ensure_db_ready() -> None:
     with DB_INIT_LOCK:
         conn = sqlite3.connect(DB_PATH)
         try:
-            required = {"settings", "monitor_snapshots"}
+            required = {"settings", "monitor_snapshots", "deal_details", "chat_panels"}
             rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('settings', 'monitor_snapshots')"
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('settings', 'monitor_snapshots', 'deal_details', 'chat_panels')"
             ).fetchall()
         finally:
             conn.close()
@@ -431,6 +479,17 @@ def init_db() -> None:
                 refreshed_at TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS deal_details (
+                lead_id INTEGER PRIMARY KEY,
+                refreshed_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_panels (
+                chat_id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL
             );
             """
             )
@@ -511,6 +570,37 @@ def show(
         tg.edit(chat_id, message_id, text, markup)
         return {"ok": True, "result": {"message_id": message_id}}
     return tg.send(chat_id, text, markup)
+
+
+def send_panel(
+    tg: TelegramClient,
+    chat_id: int,
+    text: str,
+    markup: Optional[List[List[Dict[str, str]]]] = None,
+) -> Dict[str, Any]:
+    ensure_db_ready()
+    sent = tg.send(chat_id, text, markup)
+    new_message_id = int(sent.get("result", {}).get("message_id") or 0)
+    if new_message_id:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO chat_panels(chat_id, message_id) VALUES(?, ?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET message_id = excluded.message_id",
+                (chat_id, new_message_id),
+            )
+    return sent
+
+
+def remember_panel(chat_id: int, message_id: int) -> None:
+    if not message_id:
+        return
+    ensure_db_ready()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO chat_panels(chat_id, message_id) VALUES(?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET message_id = excluded.message_id",
+            (chat_id, message_id),
+        )
 
 
 def main_menu() -> List[List[Dict[str, str]]]:
@@ -986,6 +1076,10 @@ def compact_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
         "name": lead.get("name") or str(lead["id"]),
         "pipeline_id": int(lead["pipeline_id"]),
         "status_id": int(lead["status_id"]),
+        "price": int(lead.get("price") or 0),
+        "responsible_user_id": int(lead.get("responsible_user_id") or 0),
+        "created_at": int(lead.get("created_at") or 0),
+        "updated_at": int(lead.get("updated_at") or 0),
     }
 
 
@@ -1018,6 +1112,7 @@ def empty_snapshot() -> Dict[str, Any]:
 
 
 def save_snapshot(source_key: str, payload: Dict[str, Any]) -> None:
+    refreshed_at = utc_iso()
     with db() as conn:
         conn.execute(
             """
@@ -1028,8 +1123,10 @@ def save_snapshot(source_key: str, payload: Dict[str, Any]) -> None:
                 payload = excluded.payload,
                 error = NULL
             """,
-            (source_key, utc_iso(), json.dumps(payload, ensure_ascii=False)),
+            (source_key, refreshed_at, json.dumps(payload, ensure_ascii=False)),
         )
+    with SNAPSHOT_MEMORY_LOCK:
+        SNAPSHOT_MEMORY[source_key] = (payload, refreshed_at, "")
 
 
 def save_snapshot_error(source_key: str, error: Exception) -> None:
@@ -1042,6 +1139,10 @@ def save_snapshot_error(source_key: str, error: Exception) -> None:
                 "UPDATE monitor_snapshots SET error = ? WHERE source_key = ?",
                 (str(error), source_key),
             )
+            with SNAPSHOT_MEMORY_LOCK:
+                cached = SNAPSHOT_MEMORY.get(source_key)
+                if cached:
+                    SNAPSHOT_MEMORY[source_key] = (cached[0], cached[1], str(error))
         else:
             conn.execute(
                 "INSERT INTO monitor_snapshots(source_key, refreshed_at, payload, error) VALUES(?, '', ?, ?)",
@@ -1050,6 +1151,10 @@ def save_snapshot_error(source_key: str, error: Exception) -> None:
 
 
 def load_snapshot(source_key: str) -> Tuple[Dict[str, Any], str, str]:
+    with SNAPSHOT_MEMORY_LOCK:
+        cached = SNAPSHOT_MEMORY.get(source_key)
+        if cached:
+            return cached
     ensure_db_ready()
     with db() as conn:
         row = conn.execute(
@@ -1062,7 +1167,194 @@ def load_snapshot(source_key: str) -> Tuple[Dict[str, Any], str, str]:
         payload = json.loads(row["payload"] or "{}")
     except json.JSONDecodeError:
         payload = empty_snapshot()
-    return payload, row["refreshed_at"] or "", row["error"] or ""
+    result = (payload, row["refreshed_at"] or "", row["error"] or "")
+    with SNAPSHOT_MEMORY_LOCK:
+        SNAPSHOT_MEMORY[source_key] = result
+    return result
+
+
+def crm_catalog(client: AmoClient) -> Tuple[Dict[int, str], Dict[Tuple[int, int], str]]:
+    pipelines: Dict[int, str] = {}
+    statuses: Dict[Tuple[int, int], str] = {}
+    for pipeline in client.list_pipelines():
+        pipeline_id = int(pipeline["id"])
+        pipelines[pipeline_id] = pipeline.get("name") or str(pipeline_id)
+        for status in pipeline.get("_embedded", {}).get("statuses", []):
+            statuses[(pipeline_id, int(status["id"]))] = status.get("name") or str(status["id"])
+    return pipelines, statuses
+
+
+def stage_label(
+    pipeline_id: int,
+    status_id: int,
+    pipelines: Dict[int, str],
+    statuses: Dict[Tuple[int, int], str],
+) -> str:
+    return f"{pipelines.get(pipeline_id, str(pipeline_id))} → {statuses.get((pipeline_id, status_id), str(status_id))}"
+
+
+def format_epoch(timestamp: int) -> str:
+    if not timestamp:
+        return "неизвестно"
+    return datetime.fromtimestamp(timestamp, timezone.utc).astimezone(local_tz()).strftime("%d.%m.%Y %H:%M")
+
+
+def format_path_epoch(timestamp: int) -> str:
+    if not timestamp:
+        return "неизвестно"
+    return datetime.fromtimestamp(timestamp, timezone.utc).astimezone(local_tz()).strftime("%d.%m.%Y %H:%M:%S")
+
+
+def build_deal_detail_payload(
+    lead: Dict[str, Any],
+    events: List[Dict[str, Any]],
+    pipelines: Dict[int, str],
+    statuses: Dict[Tuple[int, int], str],
+    users: Dict[int, str],
+    sources: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    lead_id = int(lead["id"])
+    relevant = [event for event in events if int(event.get("entity_id") or 0) == lead_id]
+    relevant.sort(key=lambda item: (int(item.get("created_at") or 0), str(item.get("id") or "")))
+    timeline: List[Dict[str, Any]] = []
+    if relevant:
+        first_before = event_status(relevant[0], "value_before")
+        if first_before:
+            timeline.append(
+                {
+                    "at": int(lead.get("created_at") or relevant[0].get("created_at") or 0),
+                    "label": stage_label(
+                        first_before["pipeline_id"], first_before["status_id"], pipelines, statuses
+                    ),
+                }
+            )
+        for event in relevant:
+            after = event_status(event, "value_after")
+            if not after:
+                continue
+            label = stage_label(after["pipeline_id"], after["status_id"], pipelines, statuses)
+            if timeline and timeline[-1]["label"] == label:
+                continue
+            timeline.append({"at": int(event.get("created_at") or 0), "label": label})
+    if not timeline:
+        timeline.append(
+            {
+                "at": int(lead.get("created_at") or 0),
+                "label": stage_label(
+                    int(lead["pipeline_id"]), int(lead["status_id"]), pipelines, statuses
+                ),
+            }
+        )
+    failure_reason: Optional[str] = None
+    if int(lead["pipeline_id"]) == SALES_PIPELINE_ID and int(lead["status_id"]) == SALES_FAILED_STATUS_ID:
+        for field in lead.get("custom_fields_values") or []:
+            if int(field.get("field_id") or 0) != FAILED_REASON_FIELD_ID:
+                continue
+            values = [str(item.get("value") or "").strip() for item in field.get("values") or []]
+            failure_reason = ", ".join(value for value in values if value) or "Не заполнена"
+            break
+        if failure_reason is None:
+            failure_reason = "Не заполнена"
+    return {
+        "id": lead_id,
+        "name": lead.get("name") or str(lead_id),
+        "price": int(lead.get("price") or 0),
+        "responsible": users.get(int(lead.get("responsible_user_id") or 0), "Не назначен"),
+        "created_at": int(lead.get("created_at") or 0),
+        "updated_at": int(lead.get("updated_at") or 0),
+        "current_stage": stage_label(
+            int(lead["pipeline_id"]), int(lead["status_id"]), pipelines, statuses
+        ),
+        "initial_stage": timeline[0]["label"],
+        "timeline": timeline,
+        "sources": sources or [],
+        "failure_reason": failure_reason,
+    }
+
+
+def save_deal_details(details: Iterable[Dict[str, Any]]) -> None:
+    prepared = list(details)
+    rows = [(int(detail["id"]), utc_iso(), json.dumps(detail, ensure_ascii=False)) for detail in prepared]
+    if not rows:
+        return
+    with db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO deal_details(lead_id, refreshed_at, payload)
+            VALUES(?, ?, ?)
+            ON CONFLICT(lead_id) DO UPDATE SET
+                refreshed_at = excluded.refreshed_at,
+                payload = excluded.payload
+            """,
+            rows,
+        )
+    with DEAL_DETAIL_MEMORY_LOCK:
+        for detail in prepared:
+            DEAL_DETAIL_MEMORY[int(detail["id"])] = detail
+
+
+def load_deal_detail(lead_id: int) -> Optional[Dict[str, Any]]:
+    with DEAL_DETAIL_MEMORY_LOCK:
+        cached = DEAL_DETAIL_MEMORY.get(lead_id)
+        if cached:
+            return cached
+    ensure_db_ready()
+    with db() as conn:
+        row = conn.execute("SELECT payload FROM deal_details WHERE lead_id = ?", (lead_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        detail = json.loads(row["payload"])
+        with DEAL_DETAIL_MEMORY_LOCK:
+            DEAL_DETAIL_MEMORY[lead_id] = detail
+        return detail
+    except json.JSONDecodeError:
+        return None
+
+
+def refresh_monitor_deal_details(client: AmoClient, snapshots: Dict[str, Dict[str, Any]]) -> None:
+    sources_by_lead: Dict[int, List[str]] = {}
+    for source_key, payload in snapshots.items():
+        for lead in payload.get("current") or []:
+            lead_id = int(lead["id"])
+            sources_by_lead.setdefault(lead_id, []).append(SOURCE_LABELS[source_key])
+    if not sources_by_lead:
+        return
+    leads = {
+        int(lead["id"]): lead
+        for lead in client.get_leads_by_ids(list(sources_by_lead))
+    }
+    pipelines, statuses = crm_catalog(client)
+    users = {int(user["id"]): user.get("name") or str(user["id"]) for user in client.list_users()}
+    events = client.lead_status_events(leads)
+    save_deal_details(
+        build_deal_detail_payload(
+            lead, events, pipelines, statuses, users, sources_by_lead.get(lead_id)
+        )
+        for lead_id, lead in leads.items()
+    )
+
+
+def monitored_source_labels(lead_id: int) -> List[str]:
+    labels: List[str] = []
+    for source_key in SOURCE_LABELS:
+        payload, _, _ = load_snapshot(source_key)
+        if any(int(lead["id"]) == lead_id for lead in payload.get("current") or []):
+            labels.append(SOURCE_LABELS[source_key])
+    return labels
+
+
+def fetch_and_cache_deal_detail(lead_id: int) -> Dict[str, Any]:
+    client = amo()
+    lead = client.get_lead(lead_id)
+    pipelines, statuses = crm_catalog(client)
+    users = {int(user["id"]): user.get("name") or str(user["id"]) for user in client.list_users()}
+    events = client.lead_status_events([lead_id])
+    detail = build_deal_detail_payload(
+        lead, events, pipelines, statuses, users, monitored_source_labels(lead_id)
+    )
+    save_deal_details([detail])
+    return detail
 
 
 def refresh_referral_snapshot(client: AmoClient) -> Dict[str, Any]:
@@ -1134,13 +1426,20 @@ def refresh_all_snapshots() -> None:
             "court": refresh_court_snapshot,
             "agents": refresh_referral_snapshot,
         }
+        refreshed_snapshots: Dict[str, Dict[str, Any]] = {}
         for source_key, refresher in refreshers.items():
             try:
-                save_snapshot(source_key, refresher(client))
+                payload = refresher(client)
+                save_snapshot(source_key, payload)
+                refreshed_snapshots[source_key] = payload
             except Exception as exc:
                 save_snapshot_error(source_key, exc)
                 print(f"Snapshot refresh error ({source_key}): {exc}")
         save_snapshot("lawyers", empty_snapshot())
+        try:
+            refresh_monitor_deal_details(client, refreshed_snapshots)
+        except Exception as exc:
+            print(f"Deal details refresh error: {exc}")
     finally:
         SNAPSHOT_REFRESH_LOCK.release()
 
@@ -1215,30 +1514,94 @@ def source_stage_text(source_key: str, stage_key: str, page: int) -> Tuple[str, 
                 break
         leads = stage["leads"] if stage else []
         title = stage["label"] if stage else "Сделки"
-    per_page = 10
+    per_page = 5
     pages = max(1, (len(leads) + per_page - 1) // per_page)
     page = max(0, min(page, pages - 1))
     part = leads[page * per_page : (page + 1) * per_page]
-    lines = [f"📍 <b>{esc(title)}</b>", "", f"Сделок: <b>{len(leads)}</b>", ""]
-    base_url = ENV.get("AMOCRM_BASE_URL", "").rstrip("/")
+    lines = [f"📍 <b>{esc(title)}</b>", "", f"Сделок: <b>{len(leads)}</b>"]
+    if pages > 1:
+        lines.extend(["", f"Страница <b>{page + 1}</b> из <b>{pages}</b>"])
+    rows: List[List[Dict[str, str]]] = []
     for lead in part:
-        number = lead_number(lead)
-        short_name = f"#{number}" if number else lead.get("name", lead["id"])
-        url = f"{base_url}/leads/detail/{int(lead['id'])}"
-        lines.append(f"• <a href=\"{esc(url)}\">{esc(short_name)}</a> · {esc(lead.get('name'))}")
+        label = str(lead.get("name") or lead["id"]).strip()
+        if len(label) > 58:
+            label = label[:55].rstrip() + "…"
+        callback = f"dl|{int(lead['id'])}|{source_key}|{stage_key}|{page}"
+        rows.append([{"text": label, "callback_data": callback}])
     if not part:
-        lines.append("На этой странице пусто")
+        lines.extend(["", "На этой странице пусто"])
     nav: List[Tuple[str, str]] = []
     if page > 0:
         nav.append(("← Назад", f"srcs|{source_key}|{stage_key}|{page - 1}"))
     if page < pages - 1:
         nav.append(("Вперёд →", f"srcs|{source_key}|{stage_key}|{page + 1}"))
-    rows: List[List[Tuple[str, str]]] = [nav] if nav else []
+    if nav:
+        rows.append([{"text": text, "callback_data": callback} for text, callback in nav])
     if parent_group_key:
-        rows.append([("← К этапам раздела", f"srcg|{source_key}|{parent_group_key}")])
+        rows.append([{"text": "← К этапам раздела", "callback_data": f"srcg|{source_key}|{parent_group_key}"}])
     else:
-        rows.append([("← К этапам", f"source:{source_key}")])
-    return "\n".join(lines), keyboard(rows)
+        rows.append([{"text": "← К этапам", "callback_data": f"source:{source_key}"}])
+    return "\n".join(lines), rows
+
+
+def deal_detail_text(detail: Dict[str, Any]) -> str:
+    price = f"{int(detail.get('price') or 0):,}".replace(",", " ")
+    lines = [
+        f"📋 <b>{esc(detail.get('name') or detail['id'])} (<code>{int(detail['id'])}</code>)</b>",
+        "",
+        f"Текущий этап: <b>{esc(detail.get('current_stage'))}</b>",
+        f"Начальный этап: <b>{esc(detail.get('initial_stage'))}</b>",
+        f"Ответственный: <b>{esc(detail.get('responsible'))}</b>",
+    ]
+    if detail.get("current_stage") == "Отдел продаж → Не смог реализовать":
+        lines.append(
+            f"Причина «Не смог реализовать»: <b>{esc(detail.get('failure_reason') or 'Не заполнена')}</b>"
+        )
+    lines.extend(
+        [
+            f"Бюджет: <b>{price} ₽</b>",
+            f"Создана: <b>{format_epoch(int(detail.get('created_at') or 0))}</b>",
+            f"Обновлена: <b>{format_epoch(int(detail.get('updated_at') or 0))}</b>",
+        ]
+    )
+    if detail.get("sources"):
+        lines.append(f"Источник мониторинга: <b>{esc(', '.join(detail['sources']))}</b>")
+    lines.extend(["", "<b>Путь сделки:</b>"])
+    timeline = detail.get("timeline") or []
+    visible = timeline
+    omitted = 0
+    if len(timeline) > 35:
+        visible = timeline[:1] + timeline[-34:]
+        omitted = len(timeline) - len(visible)
+    for index, item in enumerate(visible):
+        if len(visible) == 1 or index == len(visible) - 1:
+            branch = "└"
+        elif index == 0:
+            branch = "┌"
+        else:
+            branch = "├"
+        lines.append(
+            f"{branch} {esc(item.get('label'))} — {format_path_epoch(int(item.get('at') or 0))}"
+        )
+        if index == 0 and omitted:
+            lines.append(f"… пропущено промежуточных переходов: {omitted}")
+    return "\n".join(lines)
+
+
+def deal_detail_view(
+    detail: Dict[str, Any],
+    back_callback: Optional[str] = None,
+) -> Tuple[str, List[List[Dict[str, str]]]]:
+    base_url = ENV.get("AMOCRM_BASE_URL", "").rstrip("/")
+    rows: List[List[Dict[str, str]]] = []
+    rows.append(
+        [{"text": "Сделка в amoCRM", "url": f"{base_url}/leads/detail/{int(detail['id'])}"}]
+    )
+    if back_callback:
+        rows.append([{"text": "← К списку сделок", "callback_data": back_callback}])
+    else:
+        rows.append([{"text": "← Главное меню", "callback_data": "menu"}])
+    return deal_detail_text(detail), rows
 
 
 def managers_text() -> Tuple[str, List[List[Dict[str, str]]]]:
@@ -1427,16 +1790,48 @@ def handle_state(chat_id: int, text: str, tg: TelegramClient, incoming_message_i
     return False
 
 
+def extract_lead_id(text: str) -> Optional[int]:
+    value = text.strip()
+    if re.fullmatch(r"\d{5,}", value):
+        return int(value)
+    match = re.fullmatch(r"https?://[^\s]+/leads/detail/(\d+)(?:[/?#].*)?", value, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
 def handle_message(update: Dict[str, Any], tg: TelegramClient) -> None:
     message = update.get("message") or {}
     chat_id = int(message.get("chat", {}).get("id"))
     user_id = int(message.get("from", {}).get("id"))
+    text = str(message.get("text") or "").strip()
 
     if not is_admin(user_id):
-        tg.send(chat_id, unauthorized_text(user_id))
+        send_panel(tg, chat_id, unauthorized_text(user_id))
         return
     clear_state(chat_id)
-    tg.send(
+    lead_id = extract_lead_id(text)
+    if lead_id:
+        detail = load_deal_detail(lead_id)
+        if detail:
+            detail_text, markup = deal_detail_view(detail)
+            send_panel(tg, chat_id, detail_text, markup)
+            return
+        pending = send_panel(tg, chat_id, f"⏳ Собираю информацию о сделке <code>{lead_id}</code>…")
+        pending_message_id = int(pending.get("result", {}).get("message_id") or 0)
+        try:
+            detail = fetch_and_cache_deal_detail(lead_id)
+            detail_text, markup = deal_detail_view(detail)
+            show(tg, chat_id, detail_text, markup, pending_message_id or None)
+        except Exception as exc:
+            show(
+                tg,
+                chat_id,
+                f"⚠️ Не удалось получить сделку <code>{lead_id}</code>.\n\n{esc(str(exc))}",
+                main_menu(),
+                pending_message_id or None,
+            )
+        return
+    send_panel(
+        tg,
         chat_id,
         "📊 <b>Мониторинг клиентских сделок</b>\n\nВыбери, откуда пришёл клиент.",
         main_menu(),
@@ -1450,6 +1845,7 @@ def handle_callback(update: Dict[str, Any], tg: TelegramClient) -> None:
     message_id = int(callback["message"]["message_id"])
     user_id = int(callback["from"]["id"])
     tg.answer_callback(callback["id"])
+    remember_panel(chat_id, message_id)
 
     def render(text: str, markup: Optional[List[List[Dict[str, str]]]] = None) -> None:
         show(tg, chat_id, text, markup, message_id)
@@ -1471,6 +1867,14 @@ def handle_callback(update: Dict[str, Any], tg: TelegramClient) -> None:
     elif data.startswith("srcs|"):
         _, source_key, stage_key, page = data.split("|", 3)
         text, kb = source_stage_text(source_key, stage_key, int(page))
+        render(text, kb)
+    elif data.startswith("dl|"):
+        _, lead_id, source_key, stage_key, page = data.split("|", 4)
+        detail = load_deal_detail(int(lead_id))
+        if detail is None:
+            detail = fetch_and_cache_deal_detail(int(lead_id))
+        back_callback = f"srcs|{source_key}|{stage_key}|{page}"
+        text, kb = deal_detail_view(detail, back_callback)
         render(text, kb)
     else:
         render("Не понял действие. Вернёмся в меню.", main_menu())
