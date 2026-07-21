@@ -32,7 +32,8 @@ SNAPSHOT_MEMORY: Dict[str, Tuple[Dict[str, Any], str, str]] = {}
 DEAL_DETAIL_MEMORY_LOCK = threading.RLock()
 DEAL_DETAIL_MEMORY: Dict[int, Dict[str, Any]] = {}
 
-REFERRAL_PIPELINE_IDS = (10915210, 10948422)
+REFERRAL_PIPELINE_IDS = (10915210,)
+LAWYER_PIPELINE_IDS = (11110422,)
 JUDICIAL_PIPELINE_ID = 11037010
 SALES_PIPELINE_ID = 867829
 SALES_FAILED_STATUS_ID = 143
@@ -1378,6 +1379,27 @@ def refresh_referral_snapshot(client: AmoClient) -> Dict[str, Any]:
     }
 
 
+def refresh_lawyer_snapshot(client: AmoClient) -> Dict[str, Any]:
+    for pipeline_id in LAWYER_PIPELINE_IDS:
+        sync_source_history_from_amo(client, pipeline_id)
+        for lead in client.list_pipeline_leads(pipeline_id):
+            remember_source_history_lead(
+                int(lead["id"]), pipeline_id, int(lead["status_id"]), "current_pipeline"
+            )
+    ids = source_history_ids(LAWYER_PIPELINE_IDS)
+    current = [
+        compact_lead(lead)
+        for lead in client.get_leads_by_ids(ids)
+        if int(lead["pipeline_id"]) not in LAWYER_PIPELINE_IDS
+    ] if ids else []
+    return {
+        "ids": ids,
+        "current": current,
+        "groups": moved_groups(current, client),
+        "stats": {"source_pipelines": len(LAWYER_PIPELINE_IDS)},
+    }
+
+
 def refresh_court_snapshot(client: AmoClient) -> Dict[str, Any]:
     judicial_leads = client.list_pipeline_leads(JUDICIAL_PIPELINE_ID, with_contacts=True)
     judicial_ids = {int(lead["id"]) for lead in judicial_leads}
@@ -1425,6 +1447,7 @@ def refresh_all_snapshots() -> None:
         refreshers = {
             "court": refresh_court_snapshot,
             "agents": refresh_referral_snapshot,
+            "lawyers": refresh_lawyer_snapshot,
         }
         refreshed_snapshots: Dict[str, Dict[str, Any]] = {}
         for source_key, refresher in refreshers.items():
@@ -1435,7 +1458,6 @@ def refresh_all_snapshots() -> None:
             except Exception as exc:
                 save_snapshot_error(source_key, exc)
                 print(f"Snapshot refresh error ({source_key}): {exc}")
-        save_snapshot("lawyers", empty_snapshot())
         try:
             refresh_monitor_deal_details(client, refreshed_snapshots)
         except Exception as exc:
@@ -1466,9 +1488,7 @@ def source_overview(source_key: str) -> Tuple[str, List[List[Dict[str, str]]]]:
         rows.append([(f"{group['label']} · {len(group['leads'])}", callback)])
     rows.append([("← Главное меню", "menu")])
 
-    if source_key == "lawyers":
-        description = "Раздел подготовлен. Правило отбора контактов добавим позже."
-    elif groups:
+    if groups:
         description = "Выбери этап, чтобы увидеть сделки со ссылками."
     else:
         description = "В последнем снимке подходящих сделок нет."
