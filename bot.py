@@ -1853,7 +1853,7 @@ def handle_message(update: Dict[str, Any], tg: TelegramClient) -> None:
     send_panel(
         tg,
         chat_id,
-        "📊 <b>Мониторинг клиентских сделок</b>\n\nВыбери, откуда пришёл клиент.",
+        "📊 <b>Мониторинг клиентских сделок</b>\n\nВыберите, откуда пришёл клиент.",
         main_menu(),
     )
 
@@ -1875,7 +1875,7 @@ def handle_callback(update: Dict[str, Any], tg: TelegramClient) -> None:
         return
 
     if data == "menu":
-        render("📊 <b>Мониторинг клиентских сделок</b>\n\nВыбери, откуда пришёл клиент.", main_menu())
+        render("📊 <b>Мониторинг клиентских сделок</b>\n\nВыберите, откуда пришёл клиент.", main_menu())
     elif data.startswith("source:"):
         source_key = data.split(":", 1)[1]
         text, kb = source_overview(source_key)
