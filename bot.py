@@ -9,7 +9,7 @@ import traceback
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
@@ -403,9 +403,9 @@ def ensure_db_ready() -> None:
     with DB_INIT_LOCK:
         conn = sqlite3.connect(DB_PATH)
         try:
-            required = {"settings", "monitor_snapshots", "deal_details", "chat_panels"}
+            required = {"settings", "monitor_snapshots", "deal_details", "chat_panels", "court_history_leads"}
             rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('settings', 'monitor_snapshots', 'deal_details', 'chat_panels')"
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('settings', 'monitor_snapshots', 'deal_details', 'chat_panels', 'court_history_leads')"
             ).fetchall()
         finally:
             conn.close()
@@ -467,6 +467,10 @@ def init_db() -> None:
                 discovered_from TEXT NOT NULL,
                 first_seen_at TEXT NOT NULL,
                 last_event_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS court_history_leads (
+                lead_id INTEGER PRIMARY KEY
             );
 
             CREATE TABLE IF NOT EXISTS admin_states (
@@ -963,7 +967,11 @@ def seed_source_history_from_transfers() -> None:
         )
 
 
-def sync_source_history_from_amo(client: AmoClient, pipeline_id: int) -> int:
+def sync_source_history_from_amo(
+    client: AmoClient,
+    pipeline_id: int,
+    remember: Callable[..., None] = remember_source_history_lead,
+) -> int:
     pipeline = client.get_pipeline(pipeline_id)
     statuses = pipeline.get("_embedded", {}).get("statuses", [])
     setting_key = f"source_history_last_sync_at_{pipeline_id}"
@@ -994,7 +1002,7 @@ def sync_source_history_from_amo(client: AmoClient, pipeline_id: int) -> int:
                     continue
                 event_at = int(event.get("created_at") or 0)
                 max_event_at = max(max_event_at, event_at)
-                remember_source_history_lead(
+                remember(
                     int(event["entity_id"]),
                     pipeline_id,
                     before["status_id"],
@@ -1401,32 +1409,24 @@ def refresh_lawyer_snapshot(client: AmoClient) -> Dict[str, Any]:
 
 
 def refresh_court_snapshot(client: AmoClient) -> Dict[str, Any]:
-    judicial_leads = client.list_pipeline_leads(JUDICIAL_PIPELINE_ID, with_contacts=True)
-    judicial_ids = {int(lead["id"]) for lead in judicial_leads}
-    contact_ids = {
-        int(contact["id"])
-        for lead in judicial_leads
-        for contact in lead.get("_embedded", {}).get("contacts", [])
-    }
-    phones: Dict[str, str] = {}
-    for contact in client.get_contacts_by_ids(contact_ids):
-        phones.update(contact_phones(contact))
+    # Keep court membership separate: a lead may also belong to another source.
+    def remember_court_lead(lead_id: int, *_: Any) -> None:
+        with db() as conn:
+            conn.execute("INSERT OR IGNORE INTO court_history_leads(lead_id) VALUES(?)", (lead_id,))
 
-    matching_lead_ids: set[int] = set()
-    for normalized in phones:
-        for contact in client.find_contacts(normalized):
-            if normalized not in contact_phones(contact):
-                continue
-            matching_lead_ids.update(
-                int(lead["id"])
-                for lead in contact.get("_embedded", {}).get("leads", [])
-            )
-    matching_lead_ids.difference_update(judicial_ids)
+    sync_source_history_from_amo(client, JUDICIAL_PIPELINE_ID, remember_court_lead)
+    judicial_leads = client.list_pipeline_leads(JUDICIAL_PIPELINE_ID)
+    for lead in judicial_leads:
+        remember_court_lead(int(lead["id"]))
+    with db() as conn:
+        history_ids = [int(row["lead_id"]) for row in conn.execute(
+            "SELECT lead_id FROM court_history_leads ORDER BY lead_id DESC"
+        )]
     current = [
         compact_lead(lead)
-        for lead in client.get_leads_by_ids(sorted(matching_lead_ids))
+        for lead in client.get_leads_by_ids(history_ids)
         if int(lead["pipeline_id"]) != JUDICIAL_PIPELINE_ID
-    ]
+    ] if history_ids else []
     ids = sorted((int(lead["id"]) for lead in current), reverse=True)
     return {
         "ids": ids,
@@ -1434,7 +1434,6 @@ def refresh_court_snapshot(client: AmoClient) -> Dict[str, Any]:
         "groups": moved_groups(current, client),
         "stats": {
             "judicial_deals": len(judicial_leads),
-            "phones": len(phones),
         },
     }
 
